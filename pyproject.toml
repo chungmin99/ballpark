@@ -1,0 +1,71 @@
+[build-system]
+requires = ["setuptools>=61.0"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "ballpark"
+version = "0.0.0"
+description = "Sphere decomposition for collision approximation"
+readme = "README.md"
+license = { text="MIT" }
+requires-python = ">=3.10"
+classifiers = [
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "License :: OSI Approved :: MIT License",
+    "Operating System :: OS Independent"
+]
+dependencies = [
+    "numpy",
+    "trimesh",
+    "scikit-learn",
+    "scipy",
+    "jax>=0.4.0",
+    "jaxlib",
+    "optax",
+]
+
+[project.optional-dependencies]
+robot = [
+    "yourdfpy",
+    "robot_descriptions",
+]
+viz = [
+    "viser",
+]
+dev = [
+    "pyright>=1.1.308",
+    "ruff",
+    "pytest",
+]
+
+[tool.ruff.lint]
+select = [
+    "E",
+    "F",
+    "PLC",
+    "PLE",
+    "PLR",
+    "PLW",
+]
+ignore = [
+    "E731",
+    "E741",
+    "E501",
+    "E721",
+    "F722",
+    "F821",
+    "PLR2004",
+    "PLR0915",
+    "PLR0913",
+    "PLC0414",
+    "PLC0415",
+    "PLC1901",
+    "PLR5501",
+    "PLR0911",
+    "PLR0912",
+    "PLW0603",
+    "PLW2901",
+]
