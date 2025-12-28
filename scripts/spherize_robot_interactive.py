@@ -37,23 +37,16 @@ def main(
     # Load URDF for visualization
     urdf = load_robot_description(f"{robot_name}_description")
 
-    # We need a robot object with forward_kinematics - import pyroki
-    try:
-        import pyroki as pk
-
-        robot = pk.Robot.from_urdf(urdf)
-    except ImportError:
-        raise ImportError(
-            "pyroki is required for robot kinematics. "
-            "Install it or ensure it's in your path."
-        )
-
     # Reload URDF with collision meshes
     urdf_coll = yourdfpy.URDF(
         robot=urdf.robot,
         filename_handler=urdf._filename_handler,
         load_collision_meshes=True,
     )
+
+    # Get joint limits and link names (used throughout)
+    lower_limits, upper_limits = ballpark.get_joint_limits(urdf)
+    link_names = ballpark.get_link_names(urdf)
 
     # Identify links with collision geometry
     links_with_collision = []
@@ -63,7 +56,7 @@ def main(
             links_with_collision.append(link_name)
 
     # Get initial joint config (middle of limits)
-    initial_joint_cfg = (robot.joints.lower_limits + robot.joints.upper_limits) / 2
+    initial_joint_cfg = (lower_limits + upper_limits) / 2
 
     # Pre-compute mesh distances for self-collision checking (cached once at startup)
     print("Pre-computing mesh distances for self-collision checking...")
@@ -73,7 +66,6 @@ def main(
     )
     mesh_distances_cache = ballpark.compute_mesh_distances_batch(
         urdf_coll,
-        robot,
         non_contiguous_pairs,
         n_samples=1000,
         bbox_skip_threshold=0.1,
@@ -153,9 +145,9 @@ def main(
     # Joints tab - robot pose configuration (last for less clutter)
     joint_sliders = []
     with tab_group.add_tab("Joints", icon="adjustments"):
-        for i in range(robot.joints.num_actuated_joints):
-            lower = float(robot.joints.lower_limits[i])
-            upper = float(robot.joints.upper_limits[i])
+        for i in range(len(lower_limits)):
+            lower = float(lower_limits[i])
+            upper = float(upper_limits[i])
             initial = (lower + upper) / 2
             slider = server.gui.add_slider(
                 f"Joint {i}", min=lower, max=upper, step=0.01, initial_value=initial
@@ -421,7 +413,7 @@ def main(
             # Auto-allocate spheres
             current_link_budgets = ballpark.allocate_spheres_for_robot(
                 urdf_coll,
-                total_spheres=total,
+                target_spheres=total,
                 min_spheres_per_link=1,
             )
             update_link_sliders_from_budgets(current_link_budgets)
@@ -477,7 +469,6 @@ def main(
             padding=padding_slider.value,
             refine=True,
             refine_self_collision=refine_self_collision_checkbox.value,
-            robot=robot,
             mesh_distances=mesh_distances_cache,
             joint_cfg=current_joint_cfg,
             similarity_result=similarity_result,
@@ -503,7 +494,7 @@ def main(
         if not show_spheres.value:
             return
 
-        for link_idx, link_name in enumerate(robot.links.names):
+        for link_idx, link_name in enumerate(link_names):
             if link_name not in link_spheres:
                 continue
             spheres = link_spheres[link_name]
@@ -539,7 +530,7 @@ def main(
                 sphere_handles[key] = sphere_handle
 
     def update_sphere_transforms(Ts_link_world):
-        for link_idx, link_name in enumerate(robot.links.names):
+        for link_idx, link_name in enumerate(link_names):
             if link_name not in link_spheres:
                 continue
             spheres = link_spheres[link_name]
@@ -659,7 +650,7 @@ def main(
         urdf_vis.update_cfg(cfg)
 
         # Get link transforms
-        Ts_link_world = robot.forward_kinematics(cfg)
+        Ts_link_world = ballpark.get_link_transforms(urdf, cfg)
 
         # Update sphere positions
         if show_spheres.value:

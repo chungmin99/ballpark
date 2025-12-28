@@ -6,6 +6,7 @@ from dataclasses import dataclass
 
 import numpy as np
 import trimesh
+from loguru import logger
 
 from ._sphere import Sphere
 from ._adaptive_tight import spherize_adaptive_tight
@@ -15,6 +16,12 @@ from ._robot_refine import (
 )
 from ._similarity import SimilarityResult, detect_similar_links
 from ._config import BallparkConfig, UNSET, resolve_params, _UnsetType
+from ._urdf_utils import (
+    get_joint_limits,
+    get_link_transforms,
+    get_link_names,
+    get_num_actuated_joints,
+)
 
 
 @dataclass
@@ -80,7 +87,7 @@ def get_collision_mesh_for_link(urdf, link_name: str) -> trimesh.Trimesh:
                             mesh = geom_candidate.copy()
                             mesh.apply_scale(scale)
             except Exception as e:
-                print(f"Failed loading mesh for {link_name}: {e}")
+                logger.warning(f"Failed loading mesh for {link_name}: {e}")
                 continue
 
         if mesh is not None:
@@ -94,18 +101,20 @@ def get_collision_mesh_for_link(urdf, link_name: str) -> trimesh.Trimesh:
 
 def allocate_spheres_for_robot(
     urdf,
-    total_spheres: int = 100,
+    target_spheres: int = 100,
     min_spheres_per_link: int = 1,
 ) -> dict[str, int]:
     """
     Allocate sphere budget across robot links based on geometry complexity.
 
-    Distributes a total sphere budget across links proportionally based on
+    Distributes a sphere budget across links proportionally based on
     how poorly each link is approximated by a single bounding sphere.
+    The actual total may slightly exceed target_spheres when there are
+    more links than the target allows with min_spheres_per_link constraint.
 
     Args:
         urdf: yourdfpy URDF object with collision meshes loaded
-        total_spheres: Total sphere budget across the entire robot
+        target_spheres: Target sphere budget across the entire robot (may slightly exceed)
         min_spheres_per_link: Minimum spheres for any non-empty link
 
     Returns:
@@ -145,11 +154,13 @@ def allocate_spheres_for_robot(
     total_weight = sum(link_weights.values())
     link_budgets = {}
     for link_name, weight in link_weights.items():
-        budget = max(min_spheres_per_link, round(total_spheres * weight / total_weight))
+        budget = max(min_spheres_per_link, round(target_spheres * weight / total_weight))
         link_budgets[link_name] = budget
 
     # Adjust if over budget (subtract from largest allocations)
-    while sum(link_budgets.values()) > total_spheres:
+    # Note: if there are more links than target_spheres allows with min_spheres_per_link,
+    # the total will exceed target_spheres (this is intentional - we document it as a target)
+    while sum(link_budgets.values()) > target_spheres:
         max_link = max(link_budgets, key=link_budgets.get)
         if link_budgets[max_link] > min_spheres_per_link:
             link_budgets[max_link] -= 1
@@ -224,7 +235,7 @@ def compute_spheres_for_link(
             mesh,
             target_tightness=target_tightness,
             aspect_threshold=aspect_threshold,
-            max_spheres=num_spheres,
+            target_spheres=num_spheres,
             padding=padding,
             percentile=percentile,
             max_radius_ratio=max_radius_ratio,
@@ -243,13 +254,13 @@ def compute_spheres_for_link(
         )
         return spheres
     except Exception as e:
-        print(f"Spherization failed for {link_name}: {e}")
+        logger.warning(f"Spherization failed for {link_name}: {e}")
         return []
 
 
 def compute_spheres_for_robot(
     urdf,
-    total_spheres: int = 100,
+    target_spheres: int = 100,
     min_spheres_per_link: int = 1,
     link_budgets: dict[str, int] | None = None,
     *,
@@ -272,7 +283,6 @@ def compute_spheres_for_robot(
     lambda_uniform: float | _UnsetType = UNSET,
     lambda_surface: float | _UnsetType = UNSET,
     lambda_sqem: float | _UnsetType = UNSET,
-    robot=None,
     refine_self_collision: bool | _UnsetType = UNSET,
     lambda_self_collision: float | _UnsetType = UNSET,
     lambda_center_reg: float | _UnsetType = UNSET,
@@ -307,7 +317,7 @@ def compute_spheres_for_robot(
 
     Args:
         urdf: yourdfpy URDF object with collision meshes loaded
-        total_spheres: Total sphere budget across the entire robot
+        target_spheres: Target sphere count across the robot (may slightly exceed)
         min_spheres_per_link: Minimum spheres for any non-empty link
         link_budgets: Optional manual override for per-link sphere counts.
             If provided, uses these counts instead of auto-allocation.
@@ -330,7 +340,6 @@ def compute_spheres_for_robot(
         lambda_uniform: Weight for radius uniformity in refinement
         lambda_surface: Weight for surface matching loss in refinement
         lambda_sqem: Weight for SQEM loss (surface signed error with normal projection)
-        robot: pyroki Robot object (required for self-collision refinement)
         refine_self_collision: If True, apply robot-level refinement with
             self-collision avoidance between non-contiguous links at zero config
         lambda_self_collision: Weight for self-collision penalty in refinement
@@ -421,7 +430,7 @@ def compute_spheres_for_robot(
 
     # Get sphere budget per link (auto-allocate or use provided)
     if link_budgets is None:
-        budgets = allocate_spheres_for_robot(urdf, total_spheres, min_spheres_per_link)
+        budgets = allocate_spheres_for_robot(urdf, target_spheres, min_spheres_per_link)
     else:
         budgets = dict(link_budgets)  # Copy to avoid modifying input
 
@@ -477,10 +486,9 @@ def compute_spheres_for_robot(
                 link_points[link_name] = mesh.sample(n_samples)
 
     # Apply robot-level refinement with self-collision avoidance
-    if _refine_self_collision and robot is not None:
+    if _refine_self_collision:
         refinement_result = refine_spheres_for_robot(
             urdf=urdf,
-            robot=robot,
             link_spheres=link_spheres,
             link_points=link_points,
             n_iters=_refine_iters,
@@ -512,7 +520,6 @@ def compute_spheres_for_robot(
 
 def visualize_robot_spheres_viser(
     urdf,
-    robot,
     link_spheres: dict[str, list[Sphere]],
     server=None,
 ):
@@ -521,7 +528,6 @@ def visualize_robot_spheres_viser(
 
     Args:
         urdf: yourdfpy URDF object
-        robot: Robot object with links.names, joints, and forward_kinematics
         link_spheres: Dict mapping link names to lists of spheres
         server: Optional existing viser server (creates new one if None)
 
@@ -537,7 +543,7 @@ def visualize_robot_spheres_viser(
     except ImportError:
         raise ImportError(
             "viser is required for visualization. "
-            "Install with: pip install ballpark[viz]"
+            "Install with: pip install ballpark[robot]"
         )
 
     import time
@@ -548,12 +554,16 @@ def visualize_robot_spheres_viser(
     server.scene.add_grid("/ground", width=2, height=2, cell_size=0.1)
     urdf_vis = ViserUrdf(server, urdf, root_node_name="/robot")
 
+    # Get joint limits and link names
+    lower_limits, upper_limits = get_joint_limits(urdf)
+    all_link_names = get_link_names(urdf)
+
     # Joint sliders
     joint_sliders = []
     with server.gui.add_folder("Joints"):
-        for i in range(robot.joints.num_actuated_joints):
-            lower = float(robot.joints.lower_limits[i])
-            upper = float(robot.joints.upper_limits[i])
+        for i in range(len(lower_limits)):
+            lower = float(lower_limits[i])
+            upper = float(upper_limits[i])
             initial = (lower + upper) / 2
             slider = server.gui.add_slider(
                 f"Joint {i}", min=lower, max=upper, step=0.01, initial_value=initial
@@ -597,7 +607,7 @@ def visualize_robot_spheres_viser(
         if not show_spheres.value:
             return
 
-        for link_idx, link_name in enumerate(robot.links.names):
+        for link_idx, link_name in enumerate(all_link_names):
             if link_name not in link_spheres:
                 continue
             spheres = link_spheres[link_name]
@@ -633,7 +643,7 @@ def visualize_robot_spheres_viser(
                 sphere_handles[key] = sphere_handle
 
     def update_sphere_transforms(Ts_link_world):
-        for link_idx, link_name in enumerate(robot.links.names):
+        for link_idx, link_name in enumerate(all_link_names):
             if link_name not in link_spheres:
                 continue
             spheres = link_spheres[link_name]
@@ -665,7 +675,7 @@ def visualize_robot_spheres_viser(
 
         cfg = np.array([s.value for s in joint_sliders])
         urdf_vis.update_cfg(cfg)
-        Ts_link_world = robot.forward_kinematics(cfg)
+        Ts_link_world = get_link_transforms(urdf, cfg)
 
         if show_spheres.value:
             update_sphere_transforms(Ts_link_world)

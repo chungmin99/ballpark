@@ -42,8 +42,8 @@ class Args:
     preset: Literal["conservative", "balanced", "surface"] = "balanced"
     """Configuration preset."""
 
-    total_spheres: int = 100
-    """Total sphere budget across robot."""
+    target_spheres: int = 100
+    """Target sphere count across robot (may slightly exceed)."""
 
     padding: float | None = None
     """Override padding value (default: from preset)."""
@@ -53,7 +53,7 @@ class Args:
     """Enable per-link NLLS refinement."""
 
     self_collision: bool = False
-    """Enable robot-level self-collision refinement (requires pyroki)."""
+    """Enable robot-level self-collision refinement."""
 
     # Output control
     quiet: bool = False
@@ -113,30 +113,6 @@ def main(args: Args) -> None:
     log("Loading URDF...")
     urdf = load_urdf(args.urdf, args.robot_name)
 
-    # Load robot object if self-collision refinement is enabled
-    robot = None
-    if args.self_collision:
-        try:
-            import pyroki as pk
-
-            # Need to load visual URDF for pyroki
-            if args.robot_name:
-                from robot_descriptions.loaders.yourdfpy import load_robot_description
-
-                urdf_vis = load_robot_description(f"{args.robot_name}_description")
-                robot = pk.Robot.from_urdf(urdf_vis)
-            else:
-                urdf_vis = yourdfpy.URDF.load(args.urdf)
-                robot = pk.Robot.from_urdf(urdf_vis)
-            log("Loaded robot kinematics for self-collision refinement")
-        except ImportError:
-            print(
-                "Warning: pyroki is required for --self-collision. "
-                "Proceeding without self-collision refinement.",
-                file=sys.stderr,
-            )
-            args.self_collision = False
-
     # Build kwargs for compute_spheres_for_robot
     kwargs: dict = {
         "preset": args.preset,
@@ -148,11 +124,11 @@ def main(args: Args) -> None:
         kwargs["padding"] = args.padding
 
     # Add self-collision options if enabled
-    if args.self_collision and robot is not None:
-        kwargs["robot"] = robot
+    if args.self_collision:
         kwargs["refine_self_collision"] = True
-        # Get initial joint config
-        initial_cfg = (robot.joints.lower_limits + robot.joints.upper_limits) / 2
+        # Get initial joint config (middle of limits)
+        lower, upper = ballpark.get_joint_limits(urdf)
+        initial_cfg = (lower + upper) / 2
         kwargs["joint_cfg"] = initial_cfg
 
         # Pre-compute mesh distances
@@ -168,7 +144,6 @@ def main(args: Args) -> None:
         )
         mesh_distances = ballpark.compute_mesh_distances_batch(
             urdf,
-            robot,
             non_contiguous_pairs,
             n_samples=1000,
             joint_cfg=initial_cfg,
@@ -179,13 +154,13 @@ def main(args: Args) -> None:
 
     # Compute spheres
     log(
-        f"Computing spheres (preset={args.preset}, total={args.total_spheres}, "
+        f"Computing spheres (preset={args.preset}, target={args.target_spheres}, "
         f"refine={args.refine}, self_collision={args.self_collision})..."
     )
     t0 = time.perf_counter()
     result = ballpark.compute_spheres_for_robot(
         urdf,
-        total_spheres=args.total_spheres,
+        target_spheres=args.target_spheres,
         **kwargs,
     )
     elapsed_ms = (time.perf_counter() - t0) * 1000
@@ -210,4 +185,5 @@ def main(args: Args) -> None:
 
 
 if __name__ == "__main__":
-    tyro.cli(main)
+    args = tyro.cli(Args)
+    main(args)

@@ -4,6 +4,9 @@ from ._sphere import Sphere as Sphere
 from ._adaptive_tight import spherize_adaptive_tight as spherize_adaptive_tight
 from ._nlls_refine import refine_spheres_nlls as refine_spheres_nlls
 from ._robot import get_collision_mesh_for_link as get_collision_mesh_for_link
+from ._robot import get_joint_limits as get_joint_limits
+from ._robot import get_link_transforms as get_link_transforms
+from ._robot import get_link_names as get_link_names
 from ._robot import allocate_spheres_for_robot as allocate_spheres_for_robot
 from ._robot import compute_spheres_for_link as compute_spheres_for_link
 from ._robot import compute_spheres_for_robot as compute_spheres_for_robot
