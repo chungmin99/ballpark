@@ -11,6 +11,7 @@ from collections import defaultdict
 import hashlib
 
 import numpy as np
+from loguru import logger
 
 
 @dataclass
@@ -249,14 +250,14 @@ def detect_similar_links(
             if len(links) >= 2:
                 groups.append(sorted(links))
 
-    # Print detected groups
+    # Log detected groups
     if verbose:
         if groups:
-            print(f"Detected {len(groups)} similarity group(s):")
+            logger.info(f"Detected {len(groups)} similarity group(s):")
             for i, group in enumerate(groups, 1):
-                print(f"  Group {i}: {', '.join(group)}")
+                logger.info(f"  Group {i}: {', '.join(group)}")
         else:
-            print("No similar links detected.")
+            logger.info("No similar links detected.")
 
     # Step 3: Compute transforms between links in each group
     transforms: dict[tuple[str, str], np.ndarray] = {}

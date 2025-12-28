@@ -18,9 +18,12 @@ def export_spheres_to_json(
 
     Args:
         link_spheres: Dict mapping link names to lists of Sphere objects
-        output_path: Path to write JSON file
+        output_path: Path to write JSON file (must have .json extension)
         ignore_pairs: Optional list of link pairs to ignore for collision checking.
             Each pair is a tuple of (link_a, link_b).
+
+    Raises:
+        ValueError: If output_path doesn't have .json extension
 
     Output format:
         {
@@ -34,6 +37,13 @@ def export_spheres_to_json(
             "ignore_pairs": [["link_a", "link_b"], ...]  # if provided
         }
     """
+    # Validate output path
+    resolved_path = Path(output_path).resolve()
+    if resolved_path.suffix.lower() != ".json":
+        raise ValueError(
+            f"Output file must have .json extension, got: '{resolved_path.suffix}'"
+        )
+
     data: dict = {
         "spheres": {
             link_name: {
@@ -48,5 +58,5 @@ def export_spheres_to_json(
         # Sort each pair alphabetically and sort the list for consistency
         data["ignore_pairs"] = sorted([sorted(pair) for pair in ignore_pairs])
 
-    with open(output_path, "w") as f:
+    with open(resolved_path, "w") as f:
         json.dump(data, f, indent=2)

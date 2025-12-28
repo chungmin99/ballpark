@@ -25,7 +25,11 @@ def fit_sphere_minmax(
     """
     if len(points) < 4:
         c = points.mean(axis=0) if len(points) > 0 else np.zeros(3)
-        r = np.linalg.norm(points - c, axis=1).max() if len(points) > 0 else 0.01
+        if len(points) > 0:
+            r = np.linalg.norm(points - c, axis=1).max()
+            r = max(r, 1e-4)  # Ensure minimum radius for degenerate cases
+        else:
+            r = 0.01
         return Sphere(c, r * padding)
 
     center = points.mean(axis=0)
@@ -76,7 +80,7 @@ def spherize_adaptive_tight(
     mesh: trimesh.Trimesh,
     target_tightness: float = 1.2,
     aspect_threshold: float = 1.3,
-    max_spheres: int = 32,
+    target_spheres: int = 32,
     n_samples: int = 8000,
     padding: float = 1.02,
     percentile: float = 98.0,
@@ -97,14 +101,16 @@ def spherize_adaptive_tight(
     """
     Adaptive splitting with tight sphere fitting.
 
-    Uses budget-based recursion to respect max_spheres limit.
+    Uses budget-based recursion to target the specified sphere count.
     Splits regions that are too elongated or have poor tightness.
+    The actual number of spheres may slightly exceed target_spheres due to
+    minimum allocation constraints during recursive splitting.
 
     Args:
         mesh: Trimesh object to decompose
         target_tightness: Max acceptable sphere_vol/hull_vol ratio before splitting
         aspect_threshold: Max acceptable aspect ratio before splitting
-        max_spheres: Maximum number of spheres to generate
+        target_spheres: Target number of spheres to generate (may slightly exceed)
         n_samples: Number of surface samples to use
         padding: Radius multiplier for safety margin
         percentile: Percentile of distances to use for radius (handles outliers)
@@ -187,7 +193,7 @@ def spherize_adaptive_tight(
 
         return result if result else [sphere]
 
-    spheres = split(points, max_spheres)
+    spheres = split(points, target_spheres)
 
     # Post-process: cap radius variance for more uniformity (may cause under-approximation)
     if uniform_radius and len(spheres) > 1:
