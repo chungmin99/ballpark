@@ -10,7 +10,6 @@ from ._similarity import SimilarityResult as SimilarityResult
 from ._adaptive_tight import spherize_adaptive_tight as spherize
 
 # Utilities
-from ._export import export_spheres_to_json as export_spheres_to_json
 from ._robot import visualize_robot_spheres_viser as visualize_robot_spheres_viser
 
 # Configuration

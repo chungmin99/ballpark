@@ -9,7 +9,6 @@ from __future__ import annotations
 import sys
 import time
 from dataclasses import dataclass
-from pathlib import Path
 from typing import Literal
 
 import yourdfpy
@@ -24,7 +23,7 @@ class Args:
 
     Examples:
         python scripts/spherize_robot.py --robot-name panda --preset conservative
-        python scripts/spherize_robot.py --urdf my_robot.urdf --total-spheres 150
+        python scripts/spherize_robot.py --urdf my_robot.urdf --target-spheres 150
     """
 
     # Input (one required)
@@ -49,11 +48,8 @@ class Args:
     """Override padding value (default: from preset)."""
 
     # Refinement
-    refine: bool = True
-    """Enable per-link NLLS refinement."""
-
-    self_collision: bool = False
-    """Enable robot-level self-collision refinement."""
+    refine: bool = False
+    """Enable robot-level refinement with self-collision avoidance."""
 
     # Output control
     quiet: bool = False
@@ -113,67 +109,35 @@ def main(args: Args) -> None:
     log("Loading URDF...")
     urdf = load_urdf(args.urdf, args.robot_name)
 
-    # Build kwargs for compute_spheres_for_robot
+    # Create Robot instance (pre-computes similarity, mesh distances, etc.)
+    log("Analyzing robot structure...")
+    t0 = time.perf_counter()
+    robot = ballpark.Robot(urdf)
+    elapsed_ms = (time.perf_counter() - t0) * 1000
+    log(f"Found {len(robot.links)} links with collision geometry in {elapsed_ms:.1f}ms")
+
+    # Build kwargs for spherize
     kwargs: dict = {
         "preset": args.preset,
         "refine": args.refine,
     }
-
-    # Add padding override if specified
     if args.padding is not None:
         kwargs["padding"] = args.padding
-
-    # Add self-collision options if enabled
-    if args.self_collision:
-        kwargs["refine_self_collision"] = True
-        # Get initial joint config (middle of limits)
-        lower, upper = ballpark.get_joint_limits(urdf)
-        initial_cfg = (lower + upper) / 2
-        kwargs["joint_cfg"] = initial_cfg
-
-        # Pre-compute mesh distances
-        log("Pre-computing mesh distances...")
-        t0 = time.perf_counter()
-        links_with_collision = [
-            link_name
-            for link_name in urdf.link_map.keys()
-            if not ballpark.get_collision_mesh_for_link(urdf, link_name).is_empty
-        ]
-        non_contiguous_pairs = ballpark.get_non_contiguous_link_pairs(
-            urdf, links_with_collision
-        )
-        mesh_distances = ballpark.compute_mesh_distances_batch(
-            urdf,
-            non_contiguous_pairs,
-            n_samples=1000,
-            joint_cfg=initial_cfg,
-        )
-        kwargs["mesh_distances"] = mesh_distances
-        elapsed_ms = (time.perf_counter() - t0) * 1000
-        log(f"Cached {len(mesh_distances)} mesh distances in {elapsed_ms:.1f}ms")
 
     # Compute spheres
     log(
         f"Computing spheres (preset={args.preset}, target={args.target_spheres}, "
-        f"refine={args.refine}, self_collision={args.self_collision})..."
+        f"refine={args.refine})..."
     )
     t0 = time.perf_counter()
-    result = ballpark.compute_spheres_for_robot(
-        urdf,
-        target_spheres=args.target_spheres,
-        **kwargs,
-    )
+    result = robot.spherize(target_spheres=args.target_spheres, **kwargs)
     elapsed_ms = (time.perf_counter() - t0) * 1000
 
     total_spheres_count = sum(len(s) for s in result.link_spheres.values())
     log(f"Generated {total_spheres_count} spheres in {elapsed_ms:.1f}ms")
 
     # Export to JSON
-    ballpark.export_spheres_to_json(
-        link_spheres=result.link_spheres,
-        output_path=args.output,
-        ignore_pairs=result.ignore_pairs,
-    )
+    result.export(args.output)
     log(f"Exported to {args.output}")
 
     if not args.quiet:

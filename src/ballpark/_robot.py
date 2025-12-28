@@ -33,6 +33,20 @@ class RobotSpheresResult:
     link_spheres: dict[str, list[Sphere]]
     ignore_pairs: list[tuple[str, str]] | None  # None if refine_self_collision=False
 
+    def export(self, path: str) -> None:
+        """Export spheres to JSON file.
+
+        Args:
+            path: Output file path (must end with .json)
+        """
+        from ._export import export_spheres_to_json
+
+        export_spheres_to_json(
+            link_spheres=self.link_spheres,
+            output_path=path,
+            ignore_pairs=self.ignore_pairs,
+        )
+
 
 def get_collision_mesh_for_link(urdf, link_name: str) -> trimesh.Trimesh:
     """
