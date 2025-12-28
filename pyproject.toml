@@ -26,14 +26,14 @@ dependencies = [
     "jaxlib",
     "jaxlie",
     "optax",
+    "loguru",
 ]
 
 [project.optional-dependencies]
 robot = [
     "yourdfpy",
     "robot_descriptions",
-]
-viz = [
+    "tyro",
     "viser",
 ]
 dev = [

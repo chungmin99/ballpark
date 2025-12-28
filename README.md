@@ -22,8 +22,7 @@ We also include an interactive visualization and parameter adjusting GUI using [
 
 ```bash
 pip install -e .  # base installation
-pip install -e ".[robot]"  # with robot URDF support, and robot_descriptions
-pip install -e ".[viz]"  # with visualization support (viser)
+pip install -e ".[robot]"  # with robot URDF support, visualization, and CLI tools
 pip install -e ".[dev]"  # with development tools (linting, testing)
 ```
 
@@ -41,7 +40,7 @@ mesh = trimesh.load("object.stl")
 # Generate spheres with adaptive fitting and NLLS refinement
 spheres = spherize_adaptive_tight(
     mesh,
-    max_spheres=32,
+    target_spheres=32,
     refine=True,  # Enable JAX-based optimization
 )
 
@@ -66,7 +65,7 @@ urdf_coll = yourdfpy.URDF(
 # Compute spheres across all links
 result = compute_spheres_for_robot(
     urdf_coll,
-    total_spheres=100,
+    target_spheres=100,
     preset="balanced",  # or "conservative", "surface"
 )
 
