@@ -260,8 +260,9 @@ def _run_optimization(
         """Continue while not converged and under max iterations."""
         centers, radii, opt_state_c, opt_state_r, prev_loss, curr_loss, i = state
         # Use relative tolerance to handle varying loss magnitudes
+        # Handle first iteration where prev_loss is inf (inf/inf = nan, nan > tol = False)
         rel_change = jnp.abs(prev_loss - curr_loss) / (jnp.abs(prev_loss) + 1e-8)
-        not_converged = rel_change > tol
+        not_converged = jnp.logical_or(jnp.isinf(prev_loss), rel_change > tol)
         not_max_iters = i < n_iters
         return jnp.logical_and(not_converged, not_max_iters)
 
