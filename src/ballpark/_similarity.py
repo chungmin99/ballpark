@@ -28,6 +28,20 @@ class SimilarityResult:
     groups: list[list[str]] = field(default_factory=list)
     transforms: dict[tuple[str, str], np.ndarray] = field(default_factory=dict)
 
+    def get_group(self, link_name: str) -> list[str] | None:
+        """Get the similarity group containing a given link.
+
+        Args:
+            link_name: Name of the link to find
+
+        Returns:
+            List of link names in the same group, or None if not in any group.
+        """
+        for group in self.groups:
+            if link_name in group:
+                return group
+        return None
+
 
 def _get_single_collision_fingerprint(geom) -> tuple | None:
     """Extract a fingerprint for a single collision geometry.
