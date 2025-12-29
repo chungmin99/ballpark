@@ -1,11 +1,19 @@
 #!/usr/bin/env python3
-"""Visualize sphere decomposition on a robot with interactive controls."""
+"""Visualize sphere decomposition on a robot with interactive controls.
+
+This script demonstrates the Robot class API for sphere decomposition:
+- Robot(urdf) - wraps a URDF with collision meshes
+- robot.auto_allocate(total) - distributes sphere budget across links by complexity
+- robot.spherize(allocation=...) - generates spheres for each link
+- robot.compute_transforms(cfg) - forward kinematics for all links
+- result.save_json(path) - exports spheres to JSON
+"""
 
 from __future__ import annotations
 
-import json
 import time
-from typing import Literal
+from pathlib import Path
+from typing import Callable, Literal
 
 import numpy as np
 import tyro
@@ -14,129 +22,284 @@ import yourdfpy
 from robot_descriptions.loaders.yourdfpy import load_robot_description
 from viser.extras import ViserUrdf
 
-from ballpark import Robot, Sphere
-
-
-def export_to_json(link_spheres: dict[str, list[Sphere]], output_path: str) -> None:
-    """Export sphere decomposition to JSON file."""
-    data = {
-        "spheres": {
-            link_name: {
-                "centers": [sphere.center.tolist() for sphere in spheres],
-                "radii": [sphere.radius for sphere in spheres],
-            }
-            for link_name, spheres in link_spheres.items()
-        },
-    }
-    with open(output_path, "w") as f:
-        json.dump(data, f, indent=2)
+from ballpark import Robot, RobotSpheresResult, Sphere
 
 
 def main(
-    robot_name: Literal[
-        "ur5",
-        "panda",
-        "yumi",
-        "g1",
-        "iiwa14",
-        "gen2",  # kinova
-    ] = "panda",
+    robot_name: Literal["ur5", "panda", "yumi", "g1", "iiwa14", "gen2"] = "panda",
 ) -> None:
-    """Visualize sphere decomposition on a robot with interactive controls.
-
-    Args:
-        robot_name: Name of the robot to load from robot_descriptions.
-    """
+    """Visualize sphere decomposition on a robot with interactive controls."""
     print(f"Loading robot: {robot_name}...")
 
-    # Load URDF for visualization (visual meshes).
-    # You could alternatively load from a file directly:
-    # urdf = yourdfpy.URDF.load(path)
+    # Load URDF with collision meshes for sphere computation
     urdf = load_robot_description(f"{robot_name}_description")
-
-    # Reload with collision meshes for sphere computation.
     urdf_coll = yourdfpy.URDF(
         robot=urdf.robot,
         filename_handler=urdf._filename_handler,
         load_collision_meshes=True,
     )
 
-    # Create Robot instance
-    print("Analyzing robot structure...")
-    t0 = time.perf_counter()
+    # Create Robot instance - analyzes collision geometry and detects similar links
     robot = Robot(urdf_coll)
-    elapsed_ms = (time.perf_counter() - t0) * 1000
-    print(
-        f"Found {len(robot.collision_links)} links with collision geometry in {elapsed_ms:.1f}ms"
-    )
+    print(f"Found {len(robot.collision_links)} links with collision geometry")
 
-    # Get joint limits and link names (used for visualization)
-    lower_limits, upper_limits = robot.joint_limits
-    link_names = robot.links
-
-    # Set up viser server
+    # Set up viser visualization
     server = viser.ViserServer()
     server.scene.add_grid("/ground", width=2, height=2, cell_size=0.1)
     urdf_vis = ViserUrdf(server, urdf, root_node_name="/robot")
 
-    # --- GUI Controls (organized into tabs) ---
-    tab_group = server.gui.add_tab_group()
+    gui = _SpheresGui(server, robot)
+    sphere_visuals = _SphereVisuals(server, robot.links)
 
-    # Spheres tab - all sphere-related controls
-    with tab_group.add_tab("Spheres"):
-        # Visualization folder
-        with server.gui.add_folder("Visualization"):
-            show_spheres = server.gui.add_checkbox("Show Spheres", initial_value=True)
-            sphere_opacity = server.gui.add_slider(
-                "Opacity", min=0.1, max=1.0, step=0.1, initial_value=0.9
-            )
+    # Current sphere result (updated when settings change)
+    result: RobotSpheresResult | None = None
 
-        # Allocation folder
-        with server.gui.add_folder("Allocation"):
-            mode_dropdown = server.gui.add_dropdown(
-                "Mode", options=["Auto", "Manual"], initial_value="Auto"
-            )
-            total_spheres_slider = server.gui.add_slider(
-                "Total Spheres", min=0, max=100, step=1, initial_value=40
-            )
-            link_sphere_sliders: dict[str, viser.GuiInputHandle] = {}
-            per_link_folder = server.gui.add_folder("Per-Link", expand_by_default=False)
-            with per_link_folder:
-                for link_name in robot.collision_links:
-                    display_name = (
-                        link_name[:20] + "..." if len(link_name) > 20 else link_name
-                    )
-                    slider = server.gui.add_slider(
-                        display_name,
-                        min=0,
-                        max=20,
-                        step=1,
-                        initial_value=1,
-                        disabled=True,  # Start disabled (auto mode)
-                    )
-                    link_sphere_sliders[link_name] = slider
+    def on_export() -> None:
+        if result:
+            path = Path(gui.export_filename)
+            result.save_json(path)
+            print(f"Exported {result.num_spheres} spheres to {path}")
 
-        # Export folder
-        with server.gui.add_folder("Export"):
-            export_filename = server.gui.add_text(
-                "Filename", initial_value="spheres.json"
-            )
-            export_button = server.gui.add_button("Export to JSON")
+    gui.on_export(on_export)
 
-    # Joints tab - robot pose configuration
-    joint_sliders = []
-    with tab_group.add_tab("Joints"):
-        for i in range(len(lower_limits)):
-            lower = float(lower_limits[i])
-            upper = float(upper_limits[i])
-            initial = (lower + upper) / 2
-            slider = server.gui.add_slider(
-                f"Joint {i}", min=lower, max=upper, step=0.01, initial_value=initial
-            )
-            joint_sliders.append(slider)
+    print("Starting visualization (open browser to view)...")
+    while True:
+        gui.poll()
 
-    # Colors for spheres (per link)
-    sphere_colors = [
+        # Recompute spheres when allocation settings change
+        if gui.needs_recompute:
+            # Two allocation modes:
+            # - Auto: robot.auto_allocate() distributes spheres by link complexity
+            # - Manual: user specifies per-link counts (similar links stay synced)
+            if gui.is_auto_mode:
+                if gui.total_spheres == 0:
+                    allocation = {name: 0 for name in robot.collision_links}
+                else:
+                    allocation = robot.auto_allocate(gui.total_spheres)
+                gui.update_sliders_from_allocation(allocation)
+            else:
+                allocation = gui.manual_allocation
+
+            # Generate spheres for each link
+            total = sum(allocation.values())
+            if total > 0:
+                t0 = time.perf_counter()
+                result = robot.spherize(allocation=allocation)
+                elapsed = (time.perf_counter() - t0) * 1000
+                print(f"Generated {result.num_spheres} spheres in {elapsed:.1f}ms")
+            else:
+                result = RobotSpheresResult(link_spheres={})
+
+            sphere_visuals.update(result, gui.opacity, gui.show_spheres)
+            gui.mark_computed()
+            gui.mark_visuals_updated()
+
+        # Update sphere visuals if only appearance changed (opacity, visibility)
+        if gui.needs_visual_update and result:
+            sphere_visuals.update(result, gui.opacity, gui.show_spheres)
+            gui.mark_visuals_updated()
+
+        # Update robot pose from joint sliders
+        cfg = gui.joint_config
+        urdf_vis.update_cfg(cfg)
+
+        # Transform spheres to match current link poses
+        if gui.show_spheres:
+            Ts = robot.compute_transforms(cfg)
+            sphere_visuals.update_transforms(Ts)
+
+        time.sleep(0.05)
+
+
+# -----------------------------------------------------------------------------
+# GUI helpers (implementation details below)
+# -----------------------------------------------------------------------------
+
+
+class _SpheresGui:
+    """GUI controls for sphere visualization."""
+
+    def __init__(self, server: viser.ViserServer, robot: Robot):
+        self._robot = robot
+        self._export_callback: Callable[[], None] | None = None
+
+        # Track state for change detection
+        self._last_mode: str = "Auto"
+        self._last_total: int = 40
+        self._last_link_budgets: dict[str, int] = {}
+        self._last_show: bool = True
+        self._last_opacity: float = 0.9
+        self._needs_recompute = True
+        self._needs_visual_update = True
+
+        # Build GUI
+        tab_group = server.gui.add_tab_group()
+
+        # Spheres tab
+        with tab_group.add_tab("Spheres"):
+            with server.gui.add_folder("Visualization"):
+                self._show_spheres = server.gui.add_checkbox(
+                    "Show Spheres", initial_value=True
+                )
+                self._opacity = server.gui.add_slider(
+                    "Opacity", min=0.1, max=1.0, step=0.1, initial_value=0.9
+                )
+
+            with server.gui.add_folder("Allocation"):
+                self._mode = server.gui.add_dropdown(
+                    "Mode", options=["Auto", "Manual"], initial_value="Auto"
+                )
+                self._total_spheres = server.gui.add_slider(
+                    "Total Spheres", min=0, max=100, step=1, initial_value=40
+                )
+                self._link_sliders: dict[str, viser.GuiInputHandle] = {}
+                with server.gui.add_folder("Per-Link", expand_by_default=False):
+                    for link_name in robot.collision_links:
+                        display = (
+                            link_name[:20] + "..."
+                            if len(link_name) > 20
+                            else link_name
+                        )
+                        self._link_sliders[link_name] = server.gui.add_slider(
+                            display,
+                            min=0,
+                            max=20,
+                            step=1,
+                            initial_value=1,
+                            disabled=True,
+                        )
+
+            with server.gui.add_folder("Export"):
+                self._export_filename = server.gui.add_text(
+                    "Filename", initial_value="spheres.json"
+                )
+                export_button = server.gui.add_button("Export to JSON")
+
+                @export_button.on_click
+                def _(_) -> None:
+                    if self._export_callback:
+                        self._export_callback()
+
+        # Joints tab
+        lower, upper = robot.joint_limits
+        self._joint_sliders = []
+        with tab_group.add_tab("Joints"):
+            for i in range(len(lower)):
+                slider = server.gui.add_slider(
+                    f"Joint {i}",
+                    min=float(lower[i]),
+                    max=float(upper[i]),
+                    step=0.01,
+                    initial_value=(float(lower[i]) + float(upper[i])) / 2,
+                )
+                self._joint_sliders.append(slider)
+
+    def poll(self) -> None:
+        """Check for GUI changes and update internal state."""
+        # Mode change
+        if self._mode.value != self._last_mode:
+            self._last_mode = self._mode.value
+            is_manual = self._last_mode == "Manual"
+            for slider in self._link_sliders.values():
+                slider.disabled = not is_manual
+            self._total_spheres.disabled = is_manual
+            self._needs_recompute = True
+
+        # Total spheres change (auto mode)
+        if self._mode.value == "Auto" and self._total_spheres.value != self._last_total:
+            self._last_total = int(self._total_spheres.value)
+            self._needs_recompute = True
+
+        # Per-link slider change (manual mode)
+        if self._mode.value == "Manual":
+            current = {name: int(s.value) for name, s in self._link_sliders.items()}
+            if current != self._last_link_budgets:
+                # Sync similar links: when one link in a similarity group changes,
+                # update all others in the group to match
+                for name, new_val in current.items():
+                    if new_val != self._last_link_budgets.get(name, 0):
+                        group = self._get_group_for_link(name)
+                        if group and len(group) > 1:
+                            for other in group:
+                                if other != name and other in self._link_sliders:
+                                    self._link_sliders[other].value = new_val
+                current = {name: int(s.value) for name, s in self._link_sliders.items()}
+                self._total_spheres.value = sum(current.values())
+                self._last_link_budgets = current
+                self._needs_recompute = True
+
+        # Visibility/opacity change
+        if (
+            self._show_spheres.value != self._last_show
+            or self._opacity.value != self._last_opacity
+        ):
+            self._last_show = self._show_spheres.value
+            self._last_opacity = self._opacity.value
+            self._needs_visual_update = True
+
+    def _get_group_for_link(self, link_name: str) -> list[str] | None:
+        for group in self._robot._similarity.groups:
+            if link_name in group:
+                return group
+        return None
+
+    @property
+    def is_auto_mode(self) -> bool:
+        return self._mode.value == "Auto"
+
+    @property
+    def total_spheres(self) -> int:
+        return int(self._total_spheres.value)
+
+    @property
+    def manual_allocation(self) -> dict[str, int]:
+        """Per-link allocation from manual sliders."""
+        return {name: int(s.value) for name, s in self._link_sliders.items()}
+
+    def update_sliders_from_allocation(self, alloc: dict[str, int]) -> None:
+        """Update per-link sliders to reflect an allocation."""
+        for name, slider in self._link_sliders.items():
+            slider.value = alloc.get(name, 0)
+        self._last_link_budgets = alloc
+
+    @property
+    def needs_recompute(self) -> bool:
+        return self._needs_recompute
+
+    def mark_computed(self) -> None:
+        self._needs_recompute = False
+
+    @property
+    def needs_visual_update(self) -> bool:
+        return self._needs_visual_update
+
+    def mark_visuals_updated(self) -> None:
+        self._needs_visual_update = False
+
+    @property
+    def show_spheres(self) -> bool:
+        return self._show_spheres.value
+
+    @property
+    def opacity(self) -> float:
+        return self._opacity.value
+
+    @property
+    def joint_config(self) -> np.ndarray:
+        return np.array([s.value for s in self._joint_sliders])
+
+    @property
+    def export_filename(self) -> str:
+        return self._export_filename.value
+
+    def on_export(self, callback: Callable[[], None]) -> None:
+        self._export_callback = callback
+
+
+class _SphereVisuals:
+    """Manages sphere visualization in viser."""
+
+    COLORS = [
         (255, 100, 100),
         (100, 255, 100),
         (100, 100, 255),
@@ -149,248 +312,72 @@ def main(
         (255, 200, 150),
     ]
 
-    # Track state
-    sphere_frames: dict[str, viser.FrameHandle] = {}
-    sphere_handles: dict[str, viser.IcosphereHandle] = {}
-    link_spheres: dict[str, list[Sphere]] = {}
-    current_link_budgets: dict[str, int] = {}
+    def __init__(self, server: viser.ViserServer, link_names: list[str]):
+        self._server = server
+        self._link_names = link_names
+        self._frames: dict[str, viser.FrameHandle] = {}
+        self._handles: dict[str, viser.IcosphereHandle] = {}
+        self._link_spheres: dict[str, list[Sphere]] = {}
 
-    # Track last values for change detection
-    last_mode = mode_dropdown.value
-    last_total_spheres = total_spheres_slider.value
-    last_show_spheres = show_spheres.value
-    last_opacity = sphere_opacity.value
-    last_link_budgets: dict[str, int] = {}
-    needs_sphere_rebuild = True
-
-    def get_link_budgets_from_sliders() -> dict[str, int]:
-        """Read current per-link sphere counts from sliders."""
-        return {
-            link_name: int(slider.value)
-            for link_name, slider in link_sphere_sliders.items()
-        }
-
-    def update_link_sliders_from_budgets(budgets: dict[str, int]) -> None:
-        """Update per-link sliders to reflect given budgets."""
-        for link_name, slider in link_sphere_sliders.items():
-            slider.value = budgets.get(link_name, 0)
-
-    def set_link_sliders_enabled(enabled: bool) -> None:
-        """Enable or disable all per-link sphere sliders."""
-        for slider in link_sphere_sliders.values():
-            slider.disabled = not enabled
-
-    def update_total_from_link_sliders() -> None:
-        """Update total spheres slider to reflect sum of per-link allocations."""
-        total = sum(int(s.value) for s in link_sphere_sliders.values())
-        total_spheres_slider.value = total
-
-    def get_group_for_link(link_name: str) -> list[str] | None:
-        """Find the similarity group containing a link."""
-        for group in robot._similarity.groups:
-            if link_name in group:
-                return group
-        return None
-
-    def sync_similar_link_sliders(
-        old_budgets: dict[str, int], new_budgets: dict[str, int]
+    def update(
+        self,
+        result: RobotSpheresResult,
+        opacity: float,
+        visible: bool,
     ) -> None:
-        """Synchronize sphere counts for similar/duplicate links."""
-        for link_name, new_val in new_budgets.items():
-            old_val = old_budgets.get(link_name, 0)
-            if new_val != old_val:
-                group = get_group_for_link(link_name)
-                if group is not None and len(group) > 1:
-                    for other_link in group:
-                        if (
-                            other_link != link_name
-                            and other_link in link_sphere_sliders
-                        ):
-                            link_sphere_sliders[other_link].value = new_val
-
-    def compute_spheres():
-        nonlocal link_spheres, current_link_budgets
-        is_auto = mode_dropdown.value == "Auto"
-
-        if is_auto:
-            total = int(total_spheres_slider.value)
-            if total == 0:
-                link_spheres = {
-                    link_name: [] for link_name in urdf_coll.link_map.keys()
-                }
-                current_link_budgets = {
-                    link_name: 0 for link_name in robot.collision_links
-                }
-                update_link_sliders_from_budgets(current_link_budgets)
-                return
-
-            # Auto-allocate spheres
-            current_link_budgets = robot.auto_allocate(total)
-            update_link_sliders_from_budgets(current_link_budgets)
-
-            print(f"Computing spheres (auto, total={total})...")
-        else:
-            # Manual mode: read budgets from sliders
-            current_link_budgets = get_link_budgets_from_sliders()
-            total = sum(current_link_budgets.values())
-            print(f"Computing spheres (manual, total={total})...")
-
-        t0 = time.perf_counter()
-        result = robot.spherize(allocation=current_link_budgets)
-        link_spheres = result.link_spheres
-        elapsed_ms = (time.perf_counter() - t0) * 1000
-        total_generated = sum(len(s) for s in link_spheres.values())
-        print(f"Generated {total_generated} spheres in {elapsed_ms:.1f}ms")
-
-    def create_sphere_visuals():
-        nonlocal sphere_frames, sphere_handles
-
+        """Rebuild sphere visuals from result."""
         # Clear existing
-        for handle in sphere_handles.values():
-            handle.remove()
-        for handle in sphere_frames.values():
-            handle.remove()
-        sphere_handles.clear()
-        sphere_frames.clear()
+        for h in self._handles.values():
+            h.remove()
+        for f in self._frames.values():
+            f.remove()
+        self._handles.clear()
+        self._frames.clear()
+        self._link_spheres = result.link_spheres
 
-        if not show_spheres.value:
+        if not visible:
             return
 
-        for link_idx, link_name in enumerate(link_names):
-            if link_name not in link_spheres:
-                continue
-            spheres = link_spheres[link_name]
+        for link_idx, link_name in enumerate(self._link_names):
+            spheres = self._link_spheres.get(link_name, [])
             if not spheres:
                 continue
 
-            color = sphere_colors[link_idx % len(sphere_colors)]
-            rgba = (
-                color[0] / 255.0,
-                color[1] / 255.0,
-                color[2] / 255.0,
-                sphere_opacity.value,
-            )
+            color = self.COLORS[link_idx % len(self.COLORS)]
+            rgb = (color[0] / 255.0, color[1] / 255.0, color[2] / 255.0)
 
             for sphere_idx, sphere in enumerate(spheres):
                 key = f"{link_name}_{sphere_idx}"
-
-                frame = server.scene.add_frame(
+                frame = self._server.scene.add_frame(
                     f"/sphere_frames/{key}",
                     wxyz=(1, 0, 0, 0),
                     position=(0, 0, 0),
                     show_axes=False,
                 )
-                sphere_frames[key] = frame
-
-                sphere_handle = server.scene.add_icosphere(
+                self._frames[key] = frame
+                self._handles[key] = self._server.scene.add_icosphere(
                     f"/sphere_frames/{key}/sphere",
                     radius=sphere.radius,
                     position=tuple(sphere.center),
-                    color=rgba[:3],
-                    opacity=rgba[3],
+                    color=rgb,
+                    opacity=opacity,
                 )
-                sphere_handles[key] = sphere_handle
 
-    def update_sphere_transforms(Ts_link_world):
-        for link_idx, link_name in enumerate(link_names):
-            if link_name not in link_spheres:
-                continue
-            spheres = link_spheres[link_name]
+    def update_transforms(self, Ts_link_world: np.ndarray) -> None:
+        """Update sphere positions from link transforms."""
+        for link_idx, link_name in enumerate(self._link_names):
+            spheres = self._link_spheres.get(link_name, [])
             if not spheres:
                 continue
 
-            T_wxyz_xyz = Ts_link_world[link_idx]
-            wxyz = T_wxyz_xyz[:4]
-            pos = T_wxyz_xyz[4:]
+            T = Ts_link_world[link_idx]
+            wxyz, pos = T[:4], T[4:]
 
-            for sphere_idx, _ in enumerate(spheres):
+            for sphere_idx in range(len(spheres)):
                 key = f"{link_name}_{sphere_idx}"
-                if key in sphere_frames:
-                    sphere_frames[key].wxyz = wxyz
-                    sphere_frames[key].position = pos
-
-    # Export button callback
-    @export_button.on_click
-    def _(_) -> None:
-        filename = export_filename.value
-        if not filename:
-            print("Error: No filename specified")
-            return
-        if not link_spheres:
-            print("Error: No spheres computed yet")
-            return
-        export_to_json(link_spheres, filename)
-        total_spheres = sum(len(s) for s in link_spheres.values())
-        print(f"Exported {total_spheres} spheres to {filename}")
-
-    # Initial computation
-    compute_spheres()
-    create_sphere_visuals()
-
-    print("Starting visualization (open browser to view)...")
-
-    while True:
-        # Check if mode changed
-        if mode_dropdown.value != last_mode:
-            last_mode = mode_dropdown.value
-            is_manual = last_mode == "Manual"
-            set_link_sliders_enabled(is_manual)
-            total_spheres_slider.disabled = is_manual
-            # Note: folder expansion is set at creation time
-            compute_spheres()
-            last_link_budgets = get_link_budgets_from_sliders()
-            needs_sphere_rebuild = True
-
-        # Check for total spheres change (only relevant in auto mode)
-        total_changed = (
-            mode_dropdown.value == "Auto"
-            and total_spheres_slider.value != last_total_spheres
-        )
-
-        # Check for per-link slider changes (only relevant in manual mode)
-        current_budgets = get_link_budgets_from_sliders()
-        link_budgets_changed = (
-            mode_dropdown.value == "Manual" and current_budgets != last_link_budgets
-        )
-
-        # Synchronize similar links when per-link sliders change
-        if link_budgets_changed:
-            sync_similar_link_sliders(last_link_budgets, current_budgets)
-            current_budgets = get_link_budgets_from_sliders()
-            update_total_from_link_sliders()
-
-        if total_changed or link_budgets_changed:
-            last_total_spheres = total_spheres_slider.value
-            last_link_budgets = current_budgets
-            compute_spheres()
-            needs_sphere_rebuild = True
-
-        # Check if visibility or opacity changed
-        if (
-            show_spheres.value != last_show_spheres
-            or sphere_opacity.value != last_opacity
-        ):
-            last_show_spheres = show_spheres.value
-            last_opacity = sphere_opacity.value
-            needs_sphere_rebuild = True
-
-        # Rebuild sphere visuals if needed
-        if needs_sphere_rebuild:
-            create_sphere_visuals()
-            needs_sphere_rebuild = False
-
-        # Get current joint configuration
-        cfg = np.array([s.value for s in joint_sliders])
-
-        # Update robot visualization
-        urdf_vis.update_cfg(cfg)
-
-        # Get link transforms and update sphere positions
-        Ts_link_world = robot.compute_transforms(cfg)
-        if show_spheres.value:
-            update_sphere_transforms(Ts_link_world)
-
-        time.sleep(0.05)
+                if key in self._frames:
+                    self._frames[key].wxyz = wxyz
+                    self._frames[key].position = pos
 
 
 if __name__ == "__main__":
