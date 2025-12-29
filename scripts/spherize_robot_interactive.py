@@ -3,10 +3,10 @@
 
 from __future__ import annotations
 
+import json
 import time
 from typing import Literal
 
-import jax
 import numpy as np
 import tyro
 import viser
@@ -15,8 +15,23 @@ from robot_descriptions.loaders.yourdfpy import load_robot_description
 from viser.extras import ViserUrdf
 
 import ballpark
-# Import visualization utilities from internal modules
-from ballpark._urdf_utils import get_joint_limits, get_link_names, get_link_transforms
+from ballpark._spheres import Sphere
+from ballpark.utils._urdf_utils import get_joint_limits, get_link_names, get_link_transforms
+
+
+def export_to_json(link_spheres: dict[str, list[Sphere]], output_path: str) -> None:
+    """Export sphere decomposition to JSON file."""
+    data = {
+        "spheres": {
+            link_name: {
+                "centers": [sphere.center.tolist() for sphere in spheres],
+                "radii": [sphere.radius for sphere in spheres],
+            }
+            for link_name, spheres in link_spheres.items()
+        },
+    }
+    with open(output_path, "w") as f:
+        json.dump(data, f, indent=2)
 
 
 def main(
@@ -50,7 +65,7 @@ def main(
     lower_limits, upper_limits = get_joint_limits(urdf)
     link_names = get_link_names(urdf)
 
-    # Create Robot instance (pre-computes similarity, mesh distances, etc.)
+    # Create Robot instance
     print("Analyzing robot structure...")
     t0 = time.perf_counter()
     robot = ballpark.Robot(urdf_coll)
@@ -66,26 +81,12 @@ def main(
     tab_group = server.gui.add_tab_group()
 
     # Spheres tab - all sphere-related controls
-    with tab_group.add_tab("Spheres", icon="circles"):
+    with tab_group.add_tab("Spheres"):
         # Visualization folder
         with server.gui.add_folder("Visualization"):
             show_spheres = server.gui.add_checkbox("Show Spheres", initial_value=True)
             sphere_opacity = server.gui.add_slider(
                 "Opacity", min=0.1, max=1.0, step=0.1, initial_value=0.9
-            )
-
-        # Config folder - preset, refinement, padding
-        with server.gui.add_folder("Config"):
-            preset_dropdown = server.gui.add_dropdown(
-                "Preset",
-                options=["Balanced", "Conservative", "Surface"],
-                initial_value="Balanced",
-            )
-            refine_checkbox = server.gui.add_checkbox(
-                "Refinement", initial_value=False
-            )
-            padding_slider = server.gui.add_slider(
-                "Padding", min=1.0, max=1.2, step=0.01, initial_value=1.05
             )
 
         # Allocation folder
@@ -122,7 +123,7 @@ def main(
 
     # Joints tab - robot pose configuration
     joint_sliders = []
-    with tab_group.add_tab("Joints", icon="adjustments"):
+    with tab_group.add_tab("Joints"):
         for i in range(len(lower_limits)):
             lower = float(lower_limits[i])
             upper = float(upper_limits[i])
@@ -149,22 +150,12 @@ def main(
     # Track state
     sphere_frames: dict[str, viser.FrameHandle] = {}
     sphere_handles: dict[str, viser.IcosphereHandle] = {}
-    link_spheres: dict[str, list[ballpark.Sphere]] = {}
+    link_spheres: dict[str, list[Sphere]] = {}
     current_link_budgets: dict[str, int] = {}
-
-    # Map UI preset names to internal config names
-    preset_name_map = {
-        "Balanced": "balanced",
-        "Conservative": "conservative",
-        "Surface": "surface",
-    }
 
     # Track last values for change detection
     last_mode = mode_dropdown.value
     last_total_spheres = total_spheres_slider.value
-    last_padding = padding_slider.value
-    last_preset = preset_dropdown.value
-    last_refine = refine_checkbox.value
     last_show_spheres = show_spheres.value
     last_opacity = sphere_opacity.value
     last_link_budgets: dict[str, int] = {}
@@ -213,7 +204,7 @@ def main(
                             link_sphere_sliders[other_link].value = new_val
 
     def compute_spheres():
-        nonlocal link_spheres, current_link_budgets, current_result
+        nonlocal link_spheres, current_link_budgets
         is_auto = mode_dropdown.value == "Auto"
 
         if is_auto:
@@ -228,28 +219,16 @@ def main(
             current_link_budgets = robot.allocate(total)
             update_link_sliders_from_budgets(current_link_budgets)
 
-            print(
-                f"Computing spheres (auto, total={total}, padding={padding_slider.value:.2f}, "
-                f"preset={preset_dropdown.value})..."
-            )
+            print(f"Computing spheres (auto, total={total})...")
         else:
             # Manual mode: read budgets from sliders
             current_link_budgets = get_link_budgets_from_sliders()
             total = sum(current_link_budgets.values())
-            print(
-                f"Computing spheres (manual, total={total}, padding={padding_slider.value:.2f}, "
-                f"preset={preset_dropdown.value})..."
-            )
+            print(f"Computing spheres (manual, total={total})...")
 
         t0 = time.perf_counter()
-        current_result = robot.spherize(
-            budgets=current_link_budgets,
-            refine=refine_checkbox.value,
-            preset=preset_name_map[preset_dropdown.value],
-            padding=padding_slider.value,
-        )
-        link_spheres = current_result.link_spheres
-        jax.block_until_ready(None)
+        result = robot.spherize(budgets=current_link_budgets)
+        link_spheres = result.link_spheres
         elapsed_ms = (time.perf_counter() - t0) * 1000
         total_generated = sum(len(s) for s in link_spheres.values())
         print(f"Generated {total_generated} spheres in {elapsed_ms:.1f}ms")
@@ -321,9 +300,6 @@ def main(
                     sphere_frames[key].wxyz = wxyz
                     sphere_frames[key].position = pos
 
-    # Store the latest result for export
-    current_result: ballpark.RobotSpheresResult | None = None
-
     # Export button callback
     @export_button.on_click
     def _(_) -> None:
@@ -331,11 +307,11 @@ def main(
         if not filename:
             print("Error: No filename specified")
             return
-        if current_result is None:
+        if not link_spheres:
             print("Error: No spheres computed yet")
             return
-        current_result.export(filename)
-        total_spheres = sum(len(s) for s in current_result.link_spheres.values())
+        export_to_json(link_spheres, filename)
+        total_spheres = sum(len(s) for s in link_spheres.values())
         print(f"Exported {total_spheres} spheres to {filename}")
 
     # Initial computation
@@ -351,17 +327,10 @@ def main(
             is_manual = last_mode == "Manual"
             set_link_sliders_enabled(is_manual)
             total_spheres_slider.disabled = is_manual
-            per_link_folder.expand = is_manual
+            # Note: folder expansion is set at creation time
             compute_spheres()
             last_link_budgets = get_link_budgets_from_sliders()
             needs_sphere_rebuild = True
-
-        # Check for config changes
-        config_changed = (
-            preset_dropdown.value != last_preset
-            or padding_slider.value != last_padding
-            or refine_checkbox.value != last_refine
-        )
 
         # Check for total spheres change (only relevant in auto mode)
         total_changed = (
@@ -381,11 +350,8 @@ def main(
             current_budgets = get_link_budgets_from_sliders()
             update_total_from_link_sliders()
 
-        if config_changed or total_changed or link_budgets_changed:
+        if total_changed or link_budgets_changed:
             last_total_spheres = total_spheres_slider.value
-            last_padding = padding_slider.value
-            last_preset = preset_dropdown.value
-            last_refine = refine_checkbox.value
             last_link_budgets = current_budgets
             compute_spheres()
             needs_sphere_rebuild = True

@@ -6,10 +6,10 @@ Computes sphere decomposition for a robot URDF and exports to JSON.
 
 from __future__ import annotations
 
+import json
 import sys
 import time
 from dataclasses import dataclass
-from typing import Literal
 
 import yourdfpy
 import tyro
@@ -22,7 +22,7 @@ class Args:
     """Compute sphere decomposition for a robot URDF.
 
     Examples:
-        python scripts/spherize_robot.py --robot-name panda --preset conservative
+        python scripts/spherize_robot.py --robot-name panda
         python scripts/spherize_robot.py --urdf my_robot.urdf --target-spheres 150
     """
 
@@ -38,18 +38,8 @@ class Args:
     """Output JSON file path."""
 
     # Config
-    preset: Literal["conservative", "balanced", "surface"] = "balanced"
-    """Configuration preset."""
-
     target_spheres: int = 100
     """Target sphere count across robot (may slightly exceed)."""
-
-    padding: float | None = None
-    """Override padding value (default: from preset)."""
-
-    # Refinement
-    refine: bool = False
-    """Enable robot-level refinement with self-collision avoidance."""
 
     # Output control
     quiet: bool = False
@@ -90,6 +80,21 @@ def load_urdf(urdf_path: str | None, robot_name: str | None) -> yourdfpy.URDF:
         sys.exit(1)
 
 
+def export_to_json(result: ballpark._robot.RobotSpheresResult, output_path: str) -> None:
+    """Export sphere decomposition to JSON file."""
+    data = {
+        "spheres": {
+            link_name: {
+                "centers": [sphere.center.tolist() for sphere in spheres],
+                "radii": [sphere.radius for sphere in spheres],
+            }
+            for link_name, spheres in result.link_spheres.items()
+        },
+    }
+    with open(output_path, "w") as f:
+        json.dump(data, f, indent=2)
+
+
 def main(args: Args) -> None:
     """Run sphere decomposition."""
 
@@ -109,35 +114,24 @@ def main(args: Args) -> None:
     log("Loading URDF...")
     urdf = load_urdf(args.urdf, args.robot_name)
 
-    # Create Robot instance (pre-computes similarity, mesh distances, etc.)
+    # Create Robot instance
     log("Analyzing robot structure...")
     t0 = time.perf_counter()
     robot = ballpark.Robot(urdf)
     elapsed_ms = (time.perf_counter() - t0) * 1000
     log(f"Found {len(robot.links)} links with collision geometry in {elapsed_ms:.1f}ms")
 
-    # Build kwargs for spherize
-    kwargs: dict = {
-        "preset": args.preset,
-        "refine": args.refine,
-    }
-    if args.padding is not None:
-        kwargs["padding"] = args.padding
-
     # Compute spheres
-    log(
-        f"Computing spheres (preset={args.preset}, target={args.target_spheres}, "
-        f"refine={args.refine})..."
-    )
+    log(f"Computing spheres (target={args.target_spheres})...")
     t0 = time.perf_counter()
-    result = robot.spherize(target_spheres=args.target_spheres, **kwargs)
+    result = robot.spherize(target_spheres=args.target_spheres)
     elapsed_ms = (time.perf_counter() - t0) * 1000
 
     total_spheres_count = sum(len(s) for s in result.link_spheres.values())
     log(f"Generated {total_spheres_count} spheres in {elapsed_ms:.1f}ms")
 
     # Export to JSON
-    result.export(args.output)
+    export_to_json(result, args.output)
     log(f"Exported to {args.output}")
 
     if not args.quiet:

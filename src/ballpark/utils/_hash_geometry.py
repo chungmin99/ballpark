@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import numpy as np
+import trimesh
 from loguru import logger
 
 
@@ -28,7 +29,8 @@ def get_link_collision_fingerprint(
 
     # Generate fingerprint for each collision and combine them
     fingerprints = []
-    for geom in link.collisions:
+    for collision in link.collisions:
+        geom = collision.geometry
         fp = None
 
         # Check for primitive shapes.
@@ -45,18 +47,36 @@ def get_link_collision_fingerprint(
         elif geom.mesh is not None:
             if use_extents_for_mesh:
                 # Use geometry-based fingerprint
-                from yourdfpy import mesh as ymesh  # pyright: ignore[reportAttributeAccessIssue]
+                try:
+                    mesh_path = geom.mesh.filename
+                    # Resolve package:// URLs using URDF's filename handler
+                    if hasattr(urdf, "_filename_handler") and urdf._filename_handler is not None:
+                        mesh_path = urdf._filename_handler(mesh_path)
+                    loaded = trimesh.load(mesh_path, force="mesh", process=False)
+                    if isinstance(loaded, trimesh.Scene):
+                        mesh = loaded.dump(concatenate=True)
+                    else:
+                        mesh = loaded
 
-                # Load mesh, and get heuristic fingerprint
-                mesh = ymesh.load_mesh(
-                    geom.mesh.filename,
-                    scale=geom.mesh.scale,
-                )
-                if not mesh.is_empty:
-                    geom_fp = _get_geometry_fingerprint(mesh)
-                    if geom_fp is not None:
-                        fp = geom_fp
+                    if not isinstance(mesh, trimesh.Trimesh):
+                        raise ValueError(f"Unexpected mesh type: {type(mesh)}")
 
+                    if geom.mesh.scale is not None:
+                        mesh.apply_scale(np.asarray(geom.mesh.scale))
+
+                    if not mesh.is_empty:
+                        geom_fp = _get_geometry_fingerprint(mesh)
+                        if geom_fp is not None:
+                            fp = geom_fp
+                except Exception:
+                    # Fall back to filename-based fingerprint
+                    mesh_file = geom.mesh.filename
+                    scale = (
+                        tuple(geom.mesh.scale)
+                        if geom.mesh.scale is not None
+                        else (1.0, 1.0, 1.0)
+                    )
+                    fp = ("mesh_file", mesh_file, scale)
             else:
                 # Mesh from file: use filename + scale as fingerprint
                 mesh_file = geom.mesh.filename

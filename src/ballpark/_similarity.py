@@ -8,10 +8,26 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 from collections import defaultdict
-import hashlib
 
 import numpy as np
 from loguru import logger
+
+from .utils._hash_geometry import get_link_collision_fingerprint, _get_geometry_fingerprint
+
+
+@dataclass
+class SimilarityResult:
+    """Result from similarity detection, cacheable for reuse.
+
+    Attributes:
+        groups: List of link name groups. Each group contains links with
+            identical/similar collision meshes.
+        transforms: Dict mapping (link_a, link_b) to 4x4 transform matrix
+            that aligns link_a's mesh to link_b's mesh frame.
+    """
+
+    groups: list[list[str]] = field(default_factory=list)
+    transforms: dict[tuple[str, str], np.ndarray] = field(default_factory=dict)
 
 
 def _compute_alignment_transform(mesh_a, mesh_b) -> np.ndarray:
@@ -94,7 +110,7 @@ def detect_similar_links(
     fingerprint_to_links: dict[tuple, list[str]] = defaultdict(list)
 
     for link_name in link_names:
-        fp = _get_collision_fingerprint(urdf, link_name)
+        fp = get_link_collision_fingerprint(urdf, link_name)
         if fp is not None:
             fingerprint_to_links[fp].append(link_name)
 
@@ -112,7 +128,7 @@ def detect_similar_links(
 
     ungrouped_mesh_links = [
         link
-        for link, fp in ((l, _get_collision_fingerprint(urdf, l)) for l in link_names)
+        for link, fp in ((l, get_link_collision_fingerprint(urdf, l)) for l in link_names)
         if fp and link not in grouped_links and any(f[0] == "mesh_file" for f in fp)
     ]
 

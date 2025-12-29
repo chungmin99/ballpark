@@ -9,8 +9,6 @@ from scipy.spatial import ConvexHull, QhullError
 
 from ._spheres import Sphere
 
-# TODO for claude: use SpherizeConfig in spherize.
-
 
 class SpherizeConfig(TypedDict):
     """Configuration for spherize function."""
@@ -46,10 +44,22 @@ def spherize(
     minimum allocation constraints during recursive splitting.
 
     Args:
+        mesh: The mesh to spherize
+        cfg: Configuration parameters
 
     Returns:
         List of Sphere objects covering the mesh
     """
+    # Unpack config
+    target_tightness = cfg["target_tightness"]
+    aspect_threshold = cfg["aspect_threshold"]
+    target_spheres = cfg["target_spheres"]
+    n_samples = cfg["n_samples"]
+    padding = cfg["padding"]
+    percentile = cfg["percentile"]
+    max_radius_ratio = cfg["max_radius_ratio"]
+    uniform_radius = cfg["uniform_radius"]
+
     points = cast(np.ndarray, mesh.sample(n_samples))
 
     # Compute max allowed radius
