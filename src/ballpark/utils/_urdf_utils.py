@@ -85,6 +85,38 @@ def link_has_collision(urdf, link_name: str) -> bool:
     return len(urdf.link_map[link_name].collisions) > 0
 
 
+def get_adjacent_links(urdf) -> set[tuple[str, str]]:
+    """Build adjacency set from joint parent-child relationships.
+
+    Returns:
+        Set of (link_a, link_b) tuples (sorted alphabetically)
+    """
+    adjacent = set()
+    for joint in urdf.robot.joints:
+        pair = tuple(sorted([joint.parent, joint.child]))
+        adjacent.add(pair)
+    return adjacent
+
+
+def get_non_contiguous_link_pairs(urdf, link_names: list[str]) -> list[tuple[str, str]]:
+    """Get all link pairs that are NOT adjacent (for self-collision checking).
+
+    Args:
+        urdf: yourdfpy URDF object
+        link_names: List of link names to consider
+
+    Returns:
+        List of (link_a, link_b) pairs that are not adjacent in kinematic tree
+    """
+    adjacent = get_adjacent_links(urdf)
+    pairs = []
+    for i, link_a in enumerate(link_names):
+        for link_b in link_names[i + 1:]:
+            if tuple(sorted([link_a, link_b])) not in adjacent:
+                pairs.append((link_a, link_b))
+    return pairs
+
+
 def get_collision_mesh_for_link(urdf, link_name: str) -> trimesh.Trimesh:
     """
     Extract collision mesh for a given link from URDF.

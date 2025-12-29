@@ -23,6 +23,7 @@ dependencies = [
     "scikit-learn",
     "scipy",
     "jax>=0.4.0",
+    "jax_dataclasses",
     "jaxlib",
     "jaxlie",
     "optax",

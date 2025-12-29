@@ -78,7 +78,6 @@ def _compute_alignment_transform(mesh_a, mesh_b) -> np.ndarray:
 def detect_similar_links(
     urdf,
     link_names: list[str] | None = None,
-    verbose: bool = True,
 ) -> SimilarityResult:
     """Detect links with duplicate/similar collision meshes.
 
@@ -91,7 +90,6 @@ def detect_similar_links(
     Args:
         urdf: yourdfpy URDF object with collision meshes loaded
         link_names: Optional list of links to consider. If None, uses all links.
-        verbose: If True, print detected similarity groups.
 
     Returns:
         SimilarityResult containing groups of similar links and transforms
@@ -99,8 +97,8 @@ def detect_similar_links(
 
     Example:
         >>> similarity = detect_similar_links(urdf)
-        Detected 1 similarity group(s):
-          Group 1: finger_link_1, finger_link_2, finger_link_3
+        Similarity: 1 group(s), 3 links share geometry
+          Group 1: finger_link_1 -> finger_link_2, finger_link_3
         >>> print(similarity.groups)
         [['finger_link_1', 'finger_link_2', 'finger_link_3']]
     """
@@ -143,13 +141,15 @@ def detect_similar_links(
                 groups.append(sorted(links))
 
     # Log detected groups
-    if verbose:
-        if groups:
-            logger.info(f"Detected {len(groups)} similarity group(s):")
-            for i, group in enumerate(groups, 1):
-                logger.info(f"  Group {i}: {', '.join(group)}")
-        else:
-            logger.info("No similar links detected.")
+    if groups:
+        total_similar = sum(len(g) for g in groups)
+        logger.info(f"Similarity: {len(groups)} group(s), {total_similar} links share geometry")
+        for i, group in enumerate(groups, 1):
+            primary = group[0]
+            secondaries = group[1:]
+            logger.info(f"  Group {i}: {primary} -> {', '.join(secondaries)}")
+    else:
+        logger.info("Similarity: No duplicate geometries found")
 
     # Step 3: Compute transforms between links in each group
     transforms: dict[tuple[str, str], np.ndarray] = {}

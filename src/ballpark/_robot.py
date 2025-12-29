@@ -7,9 +7,13 @@ from pathlib import Path
 
 import numpy as np
 
-from ._spherize import Sphere, spherize, SpherizeConfig
+from loguru import logger
+
+from ._config import BallparkConfig, SpherePreset, SpherizeParams
+from ._spherize import Sphere, spherize
 from ._similarity import SimilarityResult, detect_similar_links
-from ._refine import RefineConfig, _refine_robot_spheres
+from ._refine import _refine_robot_spheres, _compute_min_self_collision_distance
+
 from .utils._urdf_utils import (
     get_collision_mesh_for_link,
     get_joint_limits,
@@ -65,7 +69,13 @@ class Robot:
         ]
 
         # Compute similarity
-        self._similarity = detect_similar_links(urdf, self._links, verbose=False)
+        self._similarity = detect_similar_links(urdf, self._links)
+
+        # Log robot summary
+        logger.info(
+            f"Robot: {len(self._links)} collision links, "
+            f"{len(self._similarity.groups)} similarity group(s)"
+        )
 
     @property
     def collision_links(self) -> list[str]:
@@ -142,6 +152,7 @@ class Robot:
         self,
         target_spheres: int | None = None,
         allocation: dict[str, int] | None = None,
+        config: BallparkConfig | None = None,
     ) -> RobotSpheresResult:
         """
         Generate spheres for the robot.
@@ -149,6 +160,7 @@ class Robot:
         Args:
             target_spheres: Total spheres (auto-allocates). Mutually exclusive with allocation.
             allocation: Explicit per-link allocation. Mutually exclusive with target_spheres.
+            config: Configuration for spherization. If None, uses BALANCED preset.
 
         Returns:
             RobotSpheresResult with link_spheres
@@ -159,6 +171,8 @@ class Robot:
         if (target_spheres is None) == (allocation is None):
             raise ValueError("Provide exactly one of target_spheres or allocation")
 
+        cfg = config or BallparkConfig.from_preset(SpherePreset.BALANCED)
+
         if allocation is None:
             assert target_spheres is not None
             allocation = self.auto_allocate(target_spheres)
@@ -168,12 +182,13 @@ class Robot:
             self._links,
             link_budgets=allocation,
             similarity_result=self._similarity,
+            spherize_params=cfg.spherize,
         )
 
     def refine(
         self,
         spheres_result: RobotSpheresResult,
-        config: RefineConfig | None = None,
+        config: BallparkConfig | None = None,
     ) -> RobotSpheresResult:
         """
         Refine sphere parameters using gradient-based optimization.
@@ -184,18 +199,44 @@ class Robot:
 
         Args:
             spheres_result: Result from robot.spherize()
-            config: Refinement config (uses defaults if None)
+            config: Configuration for refinement. If None, uses BALANCED preset.
 
         Returns:
             RobotSpheresResult with refined spheres
         """
+        cfg = config or BallparkConfig.from_preset(SpherePreset.BALANCED)
+
         refined_link_spheres = _refine_robot_spheres(
             self.urdf,
             spheres_result.link_spheres,
             self._similarity,
-            config=config,
+            refine_params=cfg.refine,
         )
         return RobotSpheresResult(link_spheres=refined_link_spheres)
+
+    def check_self_collision(
+        self,
+        spheres_result: RobotSpheresResult,
+        joint_cfg: np.ndarray | None = None,
+    ) -> float:
+        """
+        Check self-collision between robot spheres.
+
+        Computes the minimum signed distance between spheres of non-adjacent
+        links. Negative values indicate penetration (collision).
+
+        Args:
+            spheres_result: Result from robot.spherize() or robot.refine()
+            joint_cfg: Joint configuration for FK. If None, uses middle of limits.
+
+        Returns:
+            Minimum signed distance. Negative = collision, positive = clearance.
+        """
+        return _compute_min_self_collision_distance(
+            self.urdf,
+            spheres_result.link_spheres,
+            joint_cfg=joint_cfg,
+        )
 
 
 def _allocate_spheres_for_robot(
@@ -270,6 +311,7 @@ def _compute_spheres_for_robot(
     links: list[str],
     link_budgets: dict[str, int],
     similarity_result: SimilarityResult | None = None,
+    spherize_params: SpherizeParams | None = None,
 ) -> RobotSpheresResult:
     """
     Compute spheres for all links.
@@ -279,10 +321,12 @@ def _compute_spheres_for_robot(
         links: List of link names
         link_budgets: Dict mapping link names to sphere counts
         similarity_result: Optional similarity info for reusing spheres
+        spherize_params: Parameters for the spherization algorithm
 
     Returns:
         RobotSpheresResult with link_spheres
     """
+    params = spherize_params or SpherizeParams()
     link_spheres: dict[str, list[Sphere]] = {}
 
     # Build map of which links can reuse spheres from others
@@ -315,17 +359,7 @@ def _compute_spheres_for_robot(
             link_spheres[link_name] = []
             continue
 
-        cfg = SpherizeConfig(
-            target_tightness=1.2,
-            aspect_threshold=1.3,
-            target_spheres=budget,
-            n_samples=5000,
-            padding=1.02,
-            percentile=98.0,
-            max_radius_ratio=0.5,
-            uniform_radius=False,
-        )
-        link_spheres[link_name] = spherize(mesh, cfg)
+        link_spheres[link_name] = spherize(mesh, budget, params)
 
     return RobotSpheresResult(link_spheres=link_spheres)
 

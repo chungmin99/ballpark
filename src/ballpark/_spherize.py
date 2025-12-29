@@ -1,12 +1,17 @@
 """Adaptive tight sphere fitting algorithm."""
 
+from __future__ import annotations
+
 from dataclasses import dataclass
-from typing import cast, TypedDict
+from typing import cast, TYPE_CHECKING
 
 import numpy as np
 import trimesh
 from sklearn.decomposition import PCA
 from scipy.spatial import ConvexHull, QhullError
+
+if TYPE_CHECKING:
+    from ._config import SpherizeParams
 
 
 @dataclass
@@ -17,30 +22,10 @@ class Sphere:
     radius: float
 
 
-class SpherizeConfig(TypedDict):
-    """Configuration for spherize function."""
-
-    target_tightness: float
-    """max acceptable sphere_vol/hull_vol ratio before splitting"""
-    aspect_threshold: float
-    """max acceptable aspect ratio before splitting"""
-    target_spheres: int
-    """target number of spheres to generate (may slightly exceed)"""
-    n_samples: int
-    """number of surface samples to use"""
-    padding: float
-    """radius multiplier for safety margin"""
-    percentile: float
-    """percentile of distances to use for radius (handles outliers)"""
-    max_radius_ratio: float
-    """cap radius relative to bounding box diagonal"""
-    uniform_radius: bool
-    """if True, post-process to make radii more uniform (may under-approximate)"""
-
-
 def spherize(
     mesh: trimesh.Trimesh,
-    cfg: SpherizeConfig,
+    target_spheres: int,
+    params: "SpherizeParams | None" = None,
 ) -> list[Sphere]:
     """
     Adaptive splitting with tight sphere fitting.
@@ -52,20 +37,25 @@ def spherize(
 
     Args:
         mesh: The mesh to spherize
-        cfg: Configuration parameters
+        target_spheres: Target number of spheres to generate
+        params: Algorithm parameters. If None, uses defaults.
 
     Returns:
         List of Sphere objects covering the mesh
     """
-    # Unpack config
-    target_tightness = cfg["target_tightness"]
-    aspect_threshold = cfg["aspect_threshold"]
-    target_spheres = cfg["target_spheres"]
-    n_samples = cfg["n_samples"]
-    padding = cfg["padding"]
-    percentile = cfg["percentile"]
-    max_radius_ratio = cfg["max_radius_ratio"]
-    uniform_radius = cfg["uniform_radius"]
+    # Import here to avoid circular import
+    from ._config import SpherizeParams
+
+    p = params or SpherizeParams()
+
+    # Unpack params
+    target_tightness = p.target_tightness
+    aspect_threshold = p.aspect_threshold
+    n_samples = p.n_samples
+    padding = p.padding
+    percentile = p.percentile
+    max_radius_ratio = p.max_radius_ratio
+    uniform_radius = p.uniform_radius
 
     points = cast(np.ndarray, mesh.sample(n_samples))
 

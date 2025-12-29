@@ -4,7 +4,6 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from functools import partial
-from typing import TypedDict
 
 import numpy as np
 import jax
@@ -13,77 +12,24 @@ from jax import lax
 import jaxlie
 import optax
 from loguru import logger
-from scipy.spatial import cKDTree  # type: ignore[attr-defined]
-from scipy.spatial.transform import Rotation as R
 from scipy.optimize import linear_sum_assignment
 
 from ._spherize import Sphere
 from ._similarity import SimilarityResult
+from ._config import RefineParams
 from .utils._urdf_utils import (
     get_collision_mesh_for_link,
     get_joint_limits,
     get_link_transforms,
     get_link_names,
+    get_non_contiguous_link_pairs,
 )
-
-
-class RefineConfig(TypedDict, total=False):
-    """Configuration for robot sphere refinement."""
-
-    # Optimization params
-    n_iters: int
-    """Maximum number of optimization iterations (default: 100)"""
-    lr: float
-    """Learning rate for Adam optimizer (default: 1e-3)"""
-    tol: float
-    """Relative convergence tolerance for early stopping (default: 1e-4)"""
-    min_radius: float
-    """Minimum allowed sphere radius (default: 1e-4)"""
-
-    # Per-link loss weights
-    lambda_under: float
-    """Weight for under-approximation loss - points outside spheres (default: 1.0)"""
-    lambda_over: float
-    """Weight for over-approximation loss - sphere volume (default: 0.01)"""
-    lambda_overlap: float
-    """Weight for intra-link sphere overlap penalty (default: 0.1)"""
-    lambda_uniform: float
-    """Weight for radius uniformity within links (default: 0.0)"""
-    lambda_surface: float
-    """Weight for surface matching loss (default: 0.0)"""
-    lambda_sqem: float
-    """Weight for SQEM loss - signed error with normals (default: 0.0)"""
-
-    # Robot-level loss weights
-    lambda_self_collision: float
-    """Weight for inter-link self-collision penalty (default: 1.0)"""
-    lambda_center_reg: float
-    """Weight for center drift regularization (default: 1.0)"""
-    lambda_similarity: float
-    """Weight for similar link correspondence (default: 1.0)"""
-
-    # Other parameters
-    mesh_collision_tolerance: float
-    """Skip link pairs with mesh distance below this (default: 0.01)"""
-    joint_cfg: np.ndarray
-    """Joint configuration for FK (default: middle of limits)"""
-    n_samples: int
-    """Points to sample per link for loss computation (default: 5000)"""
+from .utils._mesh_utils import compute_mesh_distances_batch
 
 
 # =============================================================================
 # Internal dataclasses
 # =============================================================================
-
-
-@dataclass
-class _LinkMeshData:
-    """Cached mesh data for a single link."""
-
-    sampled_points: np.ndarray  # (n_samples, 3) in link-local coordinates
-    bbox_min: np.ndarray  # (3,) axis-aligned bounding box min
-    bbox_max: np.ndarray  # (3,) axis-aligned bounding box max
-    is_empty: bool
 
 
 @dataclass
@@ -121,199 +67,8 @@ class _FlattenedSphereData:
 
 
 # =============================================================================
-# URDF utilities (internal)
+# Self-collision utilities
 # =============================================================================
-
-
-def _get_adjacent_links(urdf) -> set[tuple[str, str]]:
-    """Build adjacency set from joint parent-child relationships."""
-    adjacent = set()
-    for joint in urdf.robot.joints:
-        pair = tuple(sorted([joint.parent, joint.child]))
-        adjacent.add(pair)
-    return adjacent
-
-
-def _get_non_contiguous_link_pairs(urdf, link_names: list[str]) -> list[tuple[str, str]]:
-    """Get all link pairs that are NOT adjacent (for self-collision checking)."""
-    adjacent = _get_adjacent_links(urdf)
-    pairs = []
-    for i, link_a in enumerate(link_names):
-        for link_b in link_names[i + 1:]:
-            if tuple(sorted([link_a, link_b])) not in adjacent:
-                pairs.append((link_a, link_b))
-    return pairs
-
-
-# =============================================================================
-# Mesh utilities (internal)
-# =============================================================================
-
-
-def _apply_rotation_vectorized(
-    points: np.ndarray,
-    wxyz: np.ndarray,
-    xyz: np.ndarray,
-) -> np.ndarray:
-    """Apply rotation and translation to points using vectorized quaternion ops."""
-    # scipy uses (x, y, z, w) format, jaxlie uses (w, x, y, z)
-    quat_xyzw = np.array([wxyz[1], wxyz[2], wxyz[3], wxyz[0]])
-    rot = R.from_quat(quat_xyzw)
-    return rot.apply(points) + xyz
-
-
-def _get_bbox_corners(bbox_min: np.ndarray, bbox_max: np.ndarray) -> np.ndarray:
-    """Get all 8 corners of an axis-aligned bounding box."""
-    return np.array([
-        [bbox_min[0], bbox_min[1], bbox_min[2]],
-        [bbox_min[0], bbox_min[1], bbox_max[2]],
-        [bbox_min[0], bbox_max[1], bbox_min[2]],
-        [bbox_min[0], bbox_max[1], bbox_max[2]],
-        [bbox_max[0], bbox_min[1], bbox_min[2]],
-        [bbox_max[0], bbox_min[1], bbox_max[2]],
-        [bbox_max[0], bbox_max[1], bbox_min[2]],
-        [bbox_max[0], bbox_max[1], bbox_max[2]],
-    ])
-
-
-def _bbox_distance(
-    bbox_min_a: np.ndarray,
-    bbox_max_a: np.ndarray,
-    bbox_min_b: np.ndarray,
-    bbox_max_b: np.ndarray,
-) -> float:
-    """Compute minimum distance between two axis-aligned bounding boxes."""
-    gap = np.maximum(0, np.maximum(bbox_min_a - bbox_max_b, bbox_min_b - bbox_max_a))
-    return float(np.linalg.norm(gap))
-
-
-def _precompute_link_mesh_data(
-    urdf,
-    link_names: list[str],
-    n_samples: int = 1000,
-) -> dict[str, _LinkMeshData]:
-    """Precompute mesh data for all links (load once, sample once)."""
-    link_data = {}
-    for link_name in link_names:
-        mesh = get_collision_mesh_for_link(urdf, link_name)
-
-        if mesh.is_empty:
-            link_data[link_name] = _LinkMeshData(
-                sampled_points=np.zeros((0, 3)),
-                bbox_min=np.zeros(3),
-                bbox_max=np.zeros(3),
-                is_empty=True,
-            )
-        else:
-            sampled_points = mesh.sample(n_samples)
-            bbox_min = sampled_points.min(axis=0)
-            bbox_max = sampled_points.max(axis=0)
-            link_data[link_name] = _LinkMeshData(
-                sampled_points=sampled_points,
-                bbox_min=bbox_min,
-                bbox_max=bbox_max,
-                is_empty=False,
-            )
-
-    return link_data
-
-
-def _transform_link_points_to_world(
-    link_data: dict[str, _LinkMeshData],
-    Ts_zero: np.ndarray,
-    link_name_to_idx: dict[str, int],
-) -> tuple[dict[str, np.ndarray], dict[str, np.ndarray], dict[str, np.ndarray]]:
-    """Transform all cached points to world coordinates."""
-    world_points = {}
-    world_bbox_min = {}
-    world_bbox_max = {}
-
-    for link_name, data in link_data.items():
-        if data.is_empty:
-            world_points[link_name] = np.zeros((0, 3))
-            world_bbox_min[link_name] = np.array([np.inf, np.inf, np.inf])
-            world_bbox_max[link_name] = np.array([-np.inf, -np.inf, -np.inf])
-            continue
-
-        idx = link_name_to_idx[link_name]
-        T = Ts_zero[idx]
-        wxyz, xyz = T[:4], T[4:]
-
-        pts_world = _apply_rotation_vectorized(data.sampled_points, wxyz, xyz)
-        world_points[link_name] = pts_world
-
-        corners = _get_bbox_corners(data.bbox_min, data.bbox_max)
-        corners_world = _apply_rotation_vectorized(corners, wxyz, xyz)
-        world_bbox_min[link_name] = corners_world.min(axis=0)
-        world_bbox_max[link_name] = corners_world.max(axis=0)
-
-    return world_points, world_bbox_min, world_bbox_max
-
-
-def _compute_mesh_distances_batch(
-    urdf,
-    link_pairs: list[tuple[str, str]],
-    n_samples: int = 1000,
-    bbox_skip_threshold: float = 0.1,
-    joint_cfg: np.ndarray | None = None,
-) -> dict[tuple[str, str], float]:
-    """Compute mesh distances for multiple link pairs efficiently."""
-    if not link_pairs:
-        return {}
-
-    unique_links = set()
-    for link_a, link_b in link_pairs:
-        unique_links.add(link_a)
-        unique_links.add(link_b)
-
-    link_data = _precompute_link_mesh_data(urdf, list(unique_links), n_samples)
-
-    link_names = get_link_names(urdf)
-    link_name_to_idx = {name: idx for idx, name in enumerate(link_names)}
-    if joint_cfg is None:
-        lower, upper = get_joint_limits(urdf)
-        joint_cfg = (lower + upper) / 2
-    Ts = get_link_transforms(urdf, joint_cfg)
-
-    world_points, world_bbox_min, world_bbox_max = _transform_link_points_to_world(
-        link_data, Ts, link_name_to_idx
-    )
-
-    results = {}
-
-    for link_a, link_b in link_pairs:
-        data_a = link_data[link_a]
-        data_b = link_data[link_b]
-
-        if data_a.is_empty or data_b.is_empty:
-            results[(link_a, link_b)] = float("inf")
-            continue
-
-        bbox_dist = _bbox_distance(
-            world_bbox_min[link_a],
-            world_bbox_max[link_a],
-            world_bbox_min[link_b],
-            world_bbox_max[link_b],
-        )
-
-        if bbox_dist > bbox_skip_threshold:
-            results[(link_a, link_b)] = bbox_dist
-            continue
-
-        points_a_world = world_points[link_a]
-        points_b_world = world_points[link_b]
-
-        tree_b = cKDTree(points_b_world)
-        distances_a_to_b, _ = tree_b.query(points_a_world)
-        min_dist_a_to_b = np.min(distances_a_to_b)
-
-        tree_a = cKDTree(points_a_world)
-        distances_b_to_a, _ = tree_a.query(points_b_world)
-        min_dist_b_to_a = np.min(distances_b_to_a)
-
-        results[(link_a, link_b)] = float(min(min_dist_a_to_b, min_dist_b_to_a))
-
-    return results
 
 
 def _compute_min_self_collision_distance(
@@ -338,7 +93,7 @@ def _compute_min_self_collision_distance(
     if valid_pairs is not None:
         non_contiguous_pairs = valid_pairs
     else:
-        non_contiguous_pairs = _get_non_contiguous_link_pairs(urdf, links_with_spheres)
+        non_contiguous_pairs = get_non_contiguous_link_pairs(urdf, links_with_spheres)
 
     min_dist = float("inf")
 
@@ -639,27 +394,19 @@ def _compute_robot_loss(
     initial_radii: jnp.ndarray,
     points_all: jnp.ndarray,
     scale: float,
-    min_radius: float,
-    lambda_under: float,
-    lambda_over: float,
-    lambda_overlap: float,
-    lambda_uniform: float,
-    lambda_self_collision: float,
-    lambda_center_reg: float,
-    lambda_similarity: float,
     n_links: int,
     sphere_to_link: jnp.ndarray,
     point_to_link: jnp.ndarray,
     sphere_link_mask: jnp.ndarray,
     collision_pair_mask: jnp.ndarray,
-    world_centers: jnp.ndarray,
     sphere_transforms: jnp.ndarray,
     similarity_pairs: jnp.ndarray,
+    params: RefineParams,
 ) -> jnp.ndarray:
     """Compute total loss for robot-level sphere refinement (JIT-compatible)."""
     n_spheres = centers.shape[0]
     n_points = points_all.shape[0]
-    radii = jnp.maximum(radii, min_radius)
+    radii = jnp.maximum(radii, params.min_radius)
 
     total_loss = jnp.array(0.0)
 
@@ -689,11 +436,11 @@ def _compute_robot_loss(
             jnp.where(valid_points, jnp.maximum(0.0, min_signed_dist) ** 2, 0.0)
         )
         under_approx = under_approx / (jnp.sum(valid_points) + 1e-8)
-        total_loss = total_loss + lambda_under * under_approx
+        total_loss = total_loss + params.lambda_under * under_approx
 
     # 2. Over-approximation loss (all spheres)
     over_approx = jnp.mean((radii / scale) ** 3)
-    total_loss = total_loss + lambda_over * over_approx
+    total_loss = total_loss + params.lambda_over * over_approx
 
     # 3. Intra-link overlap loss (only between spheres of same link)
     if n_spheres > 1:
@@ -708,7 +455,7 @@ def _compute_robot_loss(
         overlap_loss = jnp.sum(intra_link_mask * overlap_depth**2) / (
             jnp.sum(intra_link_mask) + 1e-8
         )
-        total_loss = total_loss + lambda_overlap * overlap_loss
+        total_loss = total_loss + params.lambda_overlap * overlap_loss
 
     # 4. Uniformity loss (per-link variance, aggregated)
     if n_spheres > 1:
@@ -733,7 +480,7 @@ def _compute_robot_loss(
         valid_links = link_counts > 1
         uniform_loss = jnp.sum(jnp.where(valid_links, link_uniform, 0.0))
         n_valid_links = jnp.sum(valid_links)
-        total_loss = total_loss + lambda_uniform * uniform_loss / (n_valid_links + 1e-8)
+        total_loss = total_loss + params.lambda_uniform * uniform_loss / (n_valid_links + 1e-8)
 
     # 5. Self-collision loss between non-contiguous links
     world_diff = (
@@ -749,14 +496,14 @@ def _compute_robot_loss(
 
     n_collision_pairs = jnp.sum(collision_mask)
     self_collision_loss = jnp.sum(collision_mask * overlap) / (n_collision_pairs + 1e-8)
-    total_loss = total_loss + lambda_self_collision * self_collision_loss
+    total_loss = total_loss + params.lambda_self_collision * self_collision_loss
 
     # 6. Center regularization
     center_drift = jnp.sum((centers - initial_centers) ** 2, axis=-1)
     center_reg = jnp.mean(center_drift) / (scale**2 + 1e-8)
     radii_drift = (radii - initial_radii) ** 2
     radii_reg = jnp.mean(radii_drift) / (scale**2 + 1e-8)
-    total_loss = total_loss + lambda_center_reg * (center_reg + radii_reg)
+    total_loss = total_loss + params.lambda_center_reg * (center_reg + radii_reg)
 
     # 7. Similarity loss (position correspondence between matched spheres)
     n_sim_pairs = similarity_pairs.shape[0]
@@ -770,7 +517,7 @@ def _compute_robot_loss(
             scale**2 + 1e-8
         )
         similarity_loss = jnp.mean(pair_dists_sq)
-        total_loss = total_loss + lambda_similarity * similarity_loss
+        total_loss = total_loss + params.lambda_similarity * similarity_loss
 
     return total_loss
 
@@ -788,17 +535,10 @@ def _run_robot_optimization(
     initial_radii: jnp.ndarray,
     points_all: jnp.ndarray,
     scale: float,
-    min_radius: float,
-    lambda_under: float,
-    lambda_over: float,
-    lambda_overlap: float,
-    lambda_uniform: float,
-    lambda_self_collision: float,
-    lambda_center_reg: float,
-    lambda_similarity: float,
+    n_links: int,
+    refine_params: RefineParams,
     lr: float,
     n_iters: int,
-    n_links: int,
     tol: float,
     sphere_to_link: jnp.ndarray,
     point_to_link: jnp.ndarray,
@@ -806,12 +546,14 @@ def _run_robot_optimization(
     collision_pair_mask: jnp.ndarray,
     sphere_transforms: jnp.ndarray,
     similarity_pairs: jnp.ndarray,
-) -> tuple[jnp.ndarray, jnp.ndarray, jnp.ndarray, jnp.ndarray]:
-    """Run the full optimization loop (JIT-compiled with early stopping)."""
+) -> tuple[jnp.ndarray, jnp.ndarray, jnp.ndarray, jnp.ndarray, jnp.ndarray]:
+    """Run the full optimization loop (JIT-compiled with early stopping).
+
+    Returns:
+        Tuple of (final_centers, final_radii, init_loss, final_loss, n_steps)
+    """
     optimizer = optax.chain(optax.clip_by_global_norm(1.0), optax.adam(lr))
     opt_state = optimizer.init((centers, radii))
-
-    world_centers = jnp.zeros_like(centers)
 
     init_loss = _compute_robot_loss(
         centers,
@@ -820,30 +562,22 @@ def _run_robot_optimization(
         initial_radii,
         points_all,
         scale,
-        min_radius,
-        lambda_under,
-        lambda_over,
-        lambda_overlap,
-        lambda_uniform,
-        lambda_self_collision,
-        lambda_center_reg,
-        lambda_similarity,
         n_links,
         sphere_to_link,
         point_to_link,
         sphere_link_mask,
         collision_pair_mask,
-        world_centers,
         sphere_transforms,
         similarity_pairs,
+        refine_params,
     )
 
     def body_fn(state):
         """Single optimization step."""
         centers, radii, opt_state, prev_loss, curr_loss, i = state
 
-        def loss_fn(params):
-            c, r = params
+        def loss_fn(opt_params):
+            c, r = opt_params
             return _compute_robot_loss(
                 c,
                 r,
@@ -851,31 +585,23 @@ def _run_robot_optimization(
                 initial_radii,
                 points_all,
                 scale,
-                min_radius,
-                lambda_under,
-                lambda_over,
-                lambda_overlap,
-                lambda_uniform,
-                lambda_self_collision,
-                lambda_center_reg,
-                lambda_similarity,
                 n_links,
                 sphere_to_link,
                 point_to_link,
                 sphere_link_mask,
                 collision_pair_mask,
-                world_centers,
                 sphere_transforms,
                 similarity_pairs,
+                refine_params,
             )
 
-        params = (centers, radii)
-        _, grads = jax.value_and_grad(loss_fn)(params)
-        updates, new_opt_state = optimizer.update(grads, opt_state, params)
-        new_params = optax.apply_updates(params, updates)
+        opt_params = (centers, radii)
+        _, grads = jax.value_and_grad(loss_fn)(opt_params)
+        updates, new_opt_state = optimizer.update(grads, opt_state, opt_params)
+        new_opt_params = optax.apply_updates(opt_params, updates)
 
-        new_centers, new_radii = new_params
-        new_radii = jnp.maximum(new_radii, min_radius)
+        new_centers, new_radii = new_opt_params
+        new_radii = jnp.maximum(new_radii, refine_params.min_radius)
 
         new_loss = loss_fn((new_centers, new_radii))
 
@@ -894,7 +620,7 @@ def _run_robot_optimization(
         cond_fn, body_fn, init_state
     )
 
-    return final_centers, final_radii, final_loss, n_steps
+    return final_centers, final_radii, init_loss, final_loss, n_steps
 
 
 # =============================================================================
@@ -906,7 +632,7 @@ def _refine_robot_spheres(
     urdf,
     link_spheres: dict[str, list[Sphere]],
     similarity_result: SimilarityResult | None,
-    config: RefineConfig | None = None,
+    refine_params: RefineParams | None = None,
 ) -> dict[str, list[Sphere]]:
     """
     Refine sphere parameters for all robot links jointly.
@@ -917,27 +643,14 @@ def _refine_robot_spheres(
         urdf: yourdfpy URDF object with collision meshes loaded
         link_spheres: Dict mapping link names to lists of Sphere objects
         similarity_result: Result from detect_similar_links() for similarity regularization
-        config: Refinement configuration (uses defaults if None)
+        refine_params: Refinement parameters. If None, uses defaults.
 
     Returns:
         Dict mapping link names to refined lists of Sphere objects
     """
     # Apply defaults
-    cfg = config or {}
-    n_iters = cfg.get("n_iters", 100)
-    lr = cfg.get("lr", 1e-3)
-    tol = cfg.get("tol", 1e-4)
-    min_radius = cfg.get("min_radius", 1e-4)
-    lambda_under = cfg.get("lambda_under", 1.0)
-    lambda_over = cfg.get("lambda_over", 0.01)
-    lambda_overlap = cfg.get("lambda_overlap", 0.1)
-    lambda_uniform = cfg.get("lambda_uniform", 0.0)
-    lambda_self_collision = cfg.get("lambda_self_collision", 1.0)
-    lambda_center_reg = cfg.get("lambda_center_reg", 1.0)
-    lambda_similarity = cfg.get("lambda_similarity", 1.0)
-    mesh_collision_tolerance = cfg.get("mesh_collision_tolerance", 0.01)
-    joint_cfg = cfg.get("joint_cfg", None)
-    n_samples = cfg.get("n_samples", 5000)
+    p = refine_params or RefineParams()
+    joint_cfg = None  # Use middle of limits by default
 
     # Get link names
     all_link_names = get_link_names(urdf)
@@ -958,7 +671,7 @@ def _refine_robot_spheres(
     for link_name in link_names:
         mesh = get_collision_mesh_for_link(urdf, link_name)
         if not mesh.is_empty:
-            link_points[link_name] = mesh.sample(n_samples)
+            link_points[link_name] = mesh.sample(p.n_samples)
         else:
             link_points[link_name] = np.zeros((0, 3))
 
@@ -971,7 +684,7 @@ def _refine_robot_spheres(
         return link_spheres
 
     # Build collision pair mask
-    non_contiguous_pairs = _get_non_contiguous_link_pairs(urdf, link_names)
+    non_contiguous_pairs = get_non_contiguous_link_pairs(urdf, link_names)
 
     logger.info("Computing mesh distances for link pairs...")
     link_name_to_internal = {name: i for i, name in enumerate(link_names)}
@@ -982,7 +695,7 @@ def _refine_robot_spheres(
         if range_a[0] < range_a[1] and range_b[0] < range_b[1]:
             pairs_with_spheres.append((link_a, link_b))
 
-    mesh_distances = _compute_mesh_distances_batch(
+    mesh_distances = compute_mesh_distances_batch(
         urdf,
         pairs_with_spheres,
         n_samples=1000,
@@ -996,7 +709,7 @@ def _refine_robot_spheres(
         flat_data.link_sphere_ranges,
         non_contiguous_pairs,
         mesh_distances,
-        mesh_collision_tolerance,
+        p.mesh_collision_tolerance,
     )
 
     if skipped_pairs:
@@ -1009,7 +722,7 @@ def _refine_robot_spheres(
         flat_data.link_names,
         flat_data.link_sphere_ranges,
         flat_data.all_centers_list,
-        lambda_similarity,
+        p.lambda_similarity,
     )
 
     if similarity_pairs_list:
@@ -1017,32 +730,28 @@ def _refine_robot_spheres(
             f"Similarity regularization: {len(similarity_pairs_list)} matched sphere pairs"
         )
 
-    # Log initial self-collision distance
+    # Log initial self-collision distance (excludes adjacent links and inherently close meshes)
     initial_min_dist = _compute_min_self_collision_distance(
-        urdf, link_spheres, joint_cfg=joint_cfg
+        urdf, link_spheres, valid_pairs=valid_pairs, joint_cfg=joint_cfg
     )
-    logger.info(f"Initial min self-collision distance: {initial_min_dist:.6f}")
+    if initial_min_dist < 0:
+        logger.info(f"Self-collision: {-initial_min_dist:.4f} penetration (initial)")
+    else:
+        logger.info(f"Self-collision: {initial_min_dist:.4f} clearance (initial)")
 
     # Run optimization
-    final_centers, final_radii, final_loss, n_steps = _run_robot_optimization(
+    final_centers, final_radii, init_loss, final_loss, n_steps = _run_robot_optimization(
         flat_data.centers,
         flat_data.radii,
         flat_data.initial_centers,
         flat_data.initial_radii,
         flat_data.points_all,
         flat_data.scale,
-        min_radius,
-        lambda_under,
-        lambda_over,
-        lambda_overlap,
-        lambda_uniform,
-        lambda_self_collision,
-        lambda_center_reg,
-        lambda_similarity,
-        lr,
-        n_iters,
         flat_data.n_links,
-        tol,
+        p,
+        p.lr,
+        p.n_iters,
+        p.tol,
         flat_data.sphere_to_link,
         flat_data.point_to_link,
         flat_data.sphere_link_mask,
@@ -1052,8 +761,8 @@ def _refine_robot_spheres(
     )
 
     logger.info(
-        f"Optimization converged in {int(n_steps)} iterations "
-        f"(final loss: {float(final_loss):.6f})"
+        f"Optimization: {int(n_steps)} iterations, "
+        f"loss {float(init_loss):.4f} -> {float(final_loss):.4f}"
     )
 
     # Unflatten results
@@ -1070,8 +779,11 @@ def _refine_robot_spheres(
 
     # Log final self-collision distance
     final_min_dist = _compute_min_self_collision_distance(
-        urdf, refined_link_spheres, joint_cfg=joint_cfg
+        urdf, refined_link_spheres, valid_pairs=valid_pairs, joint_cfg=joint_cfg
     )
-    logger.info(f"Final min self-collision distance: {final_min_dist:.6f}")
+    if final_min_dist < 0:
+        logger.info(f"Self-collision: {-final_min_dist:.4f} penetration (final)")
+    else:
+        logger.info(f"Self-collision: {final_min_dist:.4f} clearance (final)")
 
     return refined_link_spheres
