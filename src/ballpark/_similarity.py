@@ -14,143 +14,6 @@ import numpy as np
 from loguru import logger
 
 
-@dataclass
-class SimilarityResult:
-    """Result from similarity detection, cacheable for reuse.
-
-    Attributes:
-        groups: List of link name groups. Each group contains links with
-            identical/similar collision meshes.
-        transforms: Dict mapping (link_a, link_b) to 4x4 transform matrix
-            that aligns link_a's mesh to link_b's mesh frame.
-    """
-
-    groups: list[list[str]] = field(default_factory=list)
-    transforms: dict[tuple[str, str], np.ndarray] = field(default_factory=dict)
-
-    def get_group(self, link_name: str) -> list[str] | None:
-        """Get the similarity group containing a given link.
-
-        Args:
-            link_name: Name of the link to find
-
-        Returns:
-            List of link names in the same group, or None if not in any group.
-        """
-        for group in self.groups:
-            if link_name in group:
-                return group
-        return None
-
-
-def _get_single_collision_fingerprint(geom) -> tuple | None:
-    """Extract a fingerprint for a single collision geometry.
-
-    The fingerprint uniquely identifies the geometry shape, independent of
-    the link's pose in the robot.
-
-    Args:
-        geom: A collision geometry object from yourdfpy
-
-    Returns:
-        Tuple (mesh_file, scale) if from file, or
-        Tuple (geom_type, params_hash) for primitives, or
-        Tuple ("mesh", n_verts, n_faces, shape_hash) for inline meshes, or
-        None if no geometry.
-    """
-    if geom.box is not None:
-        # Box: fingerprint is the sorted extents (rotation-invariant)
-        extents = tuple(sorted(geom.box.size))
-        return ("box", extents)
-
-    elif geom.cylinder is not None:
-        return ("cylinder", geom.cylinder.radius, geom.cylinder.length)
-
-    elif geom.sphere is not None:
-        return ("sphere", geom.sphere.radius)
-
-    elif geom.mesh is not None:
-        # Mesh from file: use filename + scale as fingerprint
-        mesh_file = geom.mesh.filename
-        scale = tuple(geom.mesh.scale) if geom.mesh.scale is not None else (1.0, 1.0, 1.0)
-        return ("mesh_file", mesh_file, scale)
-
-    return None
-
-
-def _get_collision_fingerprint(urdf, link_name: str) -> tuple | None:
-    """Extract a fingerprint for a link's collision geometry.
-
-    The fingerprint uniquely identifies the geometry shape, independent of
-    the link's pose in the robot. For links with multiple collision geometries,
-    all geometries are included in a composite fingerprint.
-
-    Returns:
-        Tuple of fingerprints for all collision geometries (sorted for consistency),
-        or None if no collision geometry.
-    """
-    if link_name not in urdf.link_map:
-        return None
-
-    link = urdf.link_map[link_name]
-    if not link.collisions:
-        return None
-
-    # Generate fingerprint for each collision and combine them
-    fingerprints = []
-    for collision in link.collisions:
-        fp = _get_single_collision_fingerprint(collision.geometry)
-        if fp is not None:
-            fingerprints.append(fp)
-
-    return tuple(sorted(fingerprints)) if fingerprints else None
-
-
-def _get_geometry_fingerprint(mesh, tolerance: float = 0.001) -> tuple | None:
-    """Geometry-based fingerprint: sorted extents + volume (mirror-invariant)."""
-    if mesh.is_empty:
-        return None
-    extents = tuple(round(e / tolerance) for e in sorted(mesh.extents))
-    try:
-        vol = mesh.convex_hull.volume
-        # Round volume to 3 significant figures to handle mesh discretization noise
-        volume = round(vol, -int(np.floor(np.log10(abs(vol) + 1e-10))) + 2) if vol > 0 else 0
-    except Exception:
-        volume = 0
-    return ("geometry", extents, volume)
-
-
-def _compute_mesh_shape_hash(mesh) -> str:
-    """Compute a hash representing the mesh shape (position-invariant).
-
-    Uses sorted distances from centroid to create a rotation/translation
-    invariant signature, combined with mesh topology information.
-    """
-    if mesh.is_empty:
-        return ""
-
-    # Center the mesh
-    centroid = mesh.centroid
-    centered_verts = mesh.vertices - centroid
-
-    # Compute distances from centroid
-    distances = np.linalg.norm(centered_verts, axis=1)
-    sorted_distances = np.sort(distances)
-
-    # Quantize to finer resolution (0.1mm) to avoid false positives
-    quantized = np.round(sorted_distances * 10000).astype(np.int32)
-
-    # Include mesh topology info in the hash to distinguish different meshes
-    # Use first 100 sorted distances for efficiency while preserving uniqueness
-    hash_input = np.concatenate([
-        [len(mesh.vertices), len(mesh.faces)],
-        quantized[:100]  # Use first 100 sorted distances for efficiency
-    ])
-
-    # Hash the combined topology + shape signature
-    return hashlib.md5(hash_input.tobytes()).hexdigest()[:16]
-
-
 def _compute_alignment_transform(mesh_a, mesh_b) -> np.ndarray:
     """Compute 4x4 transform that aligns mesh_a to mesh_b.
 
@@ -248,7 +111,8 @@ def detect_similar_links(
     from ._robot import get_collision_mesh_for_link
 
     ungrouped_mesh_links = [
-        link for link, fp in ((l, _get_collision_fingerprint(urdf, l)) for l in link_names)
+        link
+        for link, fp in ((l, _get_collision_fingerprint(urdf, l)) for l in link_names)
         if fp and link not in grouped_links and any(f[0] == "mesh_file" for f in fp)
     ]
 
