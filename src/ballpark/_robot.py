@@ -9,6 +9,7 @@ import numpy as np
 
 from ._spherize import Sphere, spherize, SpherizeConfig
 from ._similarity import SimilarityResult, detect_similar_links
+from ._refine import RefineConfig, _refine_robot_spheres
 from .utils._urdf_utils import (
     get_collision_mesh_for_link,
     get_joint_limits,
@@ -168,6 +169,33 @@ class Robot:
             link_budgets=allocation,
             similarity_result=self._similarity,
         )
+
+    def refine(
+        self,
+        spheres_result: RobotSpheresResult,
+        config: RefineConfig | None = None,
+    ) -> RobotSpheresResult:
+        """
+        Refine sphere parameters using gradient-based optimization.
+
+        Jointly optimizes all spheres with:
+        - Per-link losses: coverage, volume, overlap, uniformity
+        - Robot-level losses: self-collision avoidance, similarity matching
+
+        Args:
+            spheres_result: Result from robot.spherize()
+            config: Refinement config (uses defaults if None)
+
+        Returns:
+            RobotSpheresResult with refined spheres
+        """
+        refined_link_spheres = _refine_robot_spheres(
+            self.urdf,
+            spheres_result.link_spheres,
+            self._similarity,
+            config=config,
+        )
+        return RobotSpheresResult(link_spheres=refined_link_spheres)
 
 
 def _allocate_spheres_for_robot(

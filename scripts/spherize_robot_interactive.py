@@ -5,6 +5,7 @@ This script demonstrates the Robot class API for sphere decomposition:
 - Robot(urdf) - wraps a URDF with collision meshes
 - robot.auto_allocate(total) - distributes sphere budget across links by complexity
 - robot.spherize(allocation=...) - generates spheres for each link
+- robot.refine(result) - optimizes sphere positions and radii
 - robot.compute_transforms(cfg) - forward kinematics for all links
 - result.save_json(path) - exports spheres to JSON
 """
@@ -87,6 +88,13 @@ def main(
                 result = robot.spherize(allocation=allocation)
                 elapsed = (time.perf_counter() - t0) * 1000
                 print(f"Generated {result.num_spheres} spheres in {elapsed:.1f}ms")
+
+                # Optionally refine spheres
+                if gui.refine_enabled:
+                    t0 = time.perf_counter()
+                    result = robot.refine(result)
+                    elapsed = (time.perf_counter() - t0) * 1000
+                    print(f"Refined spheres in {elapsed:.1f}ms")
             else:
                 result = RobotSpheresResult(link_spheres={})
 
@@ -129,6 +137,7 @@ class _SpheresGui:
         self._last_link_budgets: dict[str, int] = {}
         self._last_show: bool = True
         self._last_opacity: float = 0.9
+        self._last_refine: bool = False
         self._needs_recompute = True
         self._needs_visual_update = True
 
@@ -143,6 +152,9 @@ class _SpheresGui:
                 )
                 self._opacity = server.gui.add_slider(
                     "Opacity", min=0.1, max=1.0, step=0.1, initial_value=0.9
+                )
+                self._refine = server.gui.add_checkbox(
+                    "Refine (optimize)", initial_value=False
                 )
 
             with server.gui.add_folder("Allocation"):
@@ -228,6 +240,11 @@ class _SpheresGui:
                 self._last_link_budgets = current
                 self._needs_recompute = True
 
+        # Refine checkbox change
+        if self._refine.value != self._last_refine:
+            self._last_refine = self._refine.value
+            self._needs_recompute = True
+
         # Visibility/opacity change
         if (
             self._show_spheres.value != self._last_show
@@ -283,6 +300,10 @@ class _SpheresGui:
     @property
     def opacity(self) -> float:
         return self._opacity.value
+
+    @property
+    def refine_enabled(self) -> bool:
+        return self._refine.value
 
     @property
     def joint_config(self) -> np.ndarray:

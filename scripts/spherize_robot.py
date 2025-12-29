@@ -17,17 +17,19 @@ def main(
     robot_name: Literal["ur5", "panda", "yumi", "g1"] = "panda",
     target_spheres: int = 40,
     output_path: Path = Path("spheres.json"),
+    refine: bool = False,
 ) -> None:
     """Compute sphere decomposition for a robot URDF.
 
     Args:
         robot_name: Robot name from robot_descriptions (e.g., panda).
         target_spheres: Target sphere count across robot.
-        output: Output JSON file path.
-        quiet: Suppress progress output.
+        output_path: Output JSON file path.
+        refine: If True, optimize sphere positions and radii using gradient descent.
 
     Examples:
         python scripts/spherize_robot.py --robot-name panda
+        python scripts/spherize_robot.py --robot-name panda --refine
     """
     # Load URDF.
     # You could alternatively load from a file directly:
@@ -47,6 +49,11 @@ def main(
 
     logger.info(f"Computing spheres (target={target_spheres})...")
     result = robot.spherize(target_spheres=target_spheres)
+
+    # Optionally refine spheres
+    if refine:
+        logger.info("Refining spheres...")
+        result = robot.refine(result)
 
     # Export to JSON
     result.save_json(output_path)
