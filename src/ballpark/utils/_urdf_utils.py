@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import numpy as np
+import trimesh
+from loguru import logger
 from scipy.spatial.transform import Rotation
 
 
@@ -74,3 +76,87 @@ def get_link_names(urdf) -> list[str]:
 def get_num_actuated_joints(urdf) -> int:
     """Get the number of actuated joints in the URDF."""
     return len(urdf.actuated_joint_names)
+
+
+def link_has_collision(urdf, link_name: str) -> bool:
+    """Check if a link has collision geometry."""
+    if link_name not in urdf.link_map:
+        return False
+    return len(urdf.link_map[link_name].collisions) > 0
+
+
+def get_collision_mesh_for_link(urdf, link_name: str) -> trimesh.Trimesh:
+    """
+    Extract collision mesh for a given link from URDF.
+
+    Args:
+        urdf: yourdfpy URDF object with collision meshes loaded
+        link_name: Name of the link to extract
+
+    Returns:
+        Combined collision mesh for the link (empty Trimesh if no collisions)
+    """
+    if link_name not in urdf.link_map:
+        return trimesh.Trimesh()
+
+    link = urdf.link_map[link_name]
+    coll_meshes = []
+
+    for collision in link.collisions:
+        geom = collision.geometry
+        mesh = None
+
+        if collision.origin is not None:
+            transform = collision.origin
+        else:
+            transform = np.eye(4)
+
+        if geom.box is not None:
+            mesh = trimesh.creation.box(extents=geom.box.size)
+        elif geom.cylinder is not None:
+            mesh = trimesh.creation.cylinder(
+                radius=geom.cylinder.radius, height=geom.cylinder.length
+            )
+        elif geom.sphere is not None:
+            mesh = trimesh.creation.icosphere(radius=geom.sphere.radius)
+        elif geom.mesh is not None:
+            mesh_path = geom.mesh.filename
+            # Resolve package:// URLs using URDF's filename handler
+            if (
+                hasattr(urdf, "_filename_handler")
+                and urdf._filename_handler is not None
+            ):
+                mesh_path = urdf._filename_handler(mesh_path)
+            try:
+                loaded_obj = trimesh.load(
+                    mesh_path,
+                    force="mesh",
+                    process=False,
+                )
+                if isinstance(loaded_obj, trimesh.Scene):
+                    mesh = loaded_obj.dump(concatenate=True)
+                else:
+                    mesh = loaded_obj
+
+                # Ensure mesh is a Trimesh (not a list)
+                if not isinstance(mesh, trimesh.Trimesh):
+                    logger.warning(
+                        f"Unexpected mesh type from {mesh_path}: {type(mesh)}"
+                    )
+                    continue
+
+                if geom.mesh.scale is not None:
+                    scale = np.asarray(geom.mesh.scale)
+                    mesh.apply_scale(scale)
+            except Exception as e:
+                logger.warning(f"Failed to load mesh {mesh_path}: {e}")
+                continue
+
+        if mesh is not None:
+            mesh.apply_transform(transform)
+            coll_meshes.append(mesh)
+
+    if not coll_meshes:
+        return trimesh.Trimesh()
+
+    return trimesh.util.concatenate(coll_meshes)

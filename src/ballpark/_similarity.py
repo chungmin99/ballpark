@@ -13,6 +13,7 @@ import numpy as np
 from loguru import logger
 
 from .utils._hash_geometry import get_link_collision_fingerprint, _get_geometry_fingerprint
+from .utils._urdf_utils import get_collision_mesh_for_link
 
 
 @dataclass
@@ -123,9 +124,6 @@ def detect_similar_links(
             grouped_links.update(links)
 
     # Step 2b: Geometry-based grouping for mesh-file links not yet grouped
-    # Lazy import to avoid circular dependency
-    from ._robot import get_collision_mesh_for_link
-
     ungrouped_mesh_links = [
         link
         for link, fp in ((l, get_link_collision_fingerprint(urdf, l)) for l in link_names)

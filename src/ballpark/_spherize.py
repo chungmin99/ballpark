@@ -1,5 +1,6 @@
 """Adaptive tight sphere fitting algorithm."""
 
+from dataclasses import dataclass
 from typing import cast, TypedDict
 
 import numpy as np
@@ -7,7 +8,13 @@ import trimesh
 from sklearn.decomposition import PCA
 from scipy.spatial import ConvexHull, QhullError
 
-from ._spheres import Sphere
+
+@dataclass
+class Sphere:
+    """A sphere defined by center and radius."""
+
+    center: np.ndarray
+    radius: float
 
 
 class SpherizeConfig(TypedDict):

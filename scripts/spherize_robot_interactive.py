@@ -14,9 +14,7 @@ import yourdfpy
 from robot_descriptions.loaders.yourdfpy import load_robot_description
 from viser.extras import ViserUrdf
 
-import ballpark
-from ballpark._spheres import Sphere
-from ballpark.utils._urdf_utils import get_joint_limits, get_link_names, get_link_transforms
+from ballpark import Robot, Sphere
 
 
 def export_to_json(link_spheres: dict[str, list[Sphere]], output_path: str) -> None:
@@ -51,26 +49,30 @@ def main(
     """
     print(f"Loading robot: {robot_name}...")
 
-    # Load URDF for visualization
+    # Load URDF for visualization (visual meshes).
+    # You could alternatively load from a file directly:
+    # urdf = yourdfpy.URDF.load(path)
     urdf = load_robot_description(f"{robot_name}_description")
 
-    # Reload URDF with collision meshes
+    # Reload with collision meshes for sphere computation.
     urdf_coll = yourdfpy.URDF(
         robot=urdf.robot,
         filename_handler=urdf._filename_handler,
         load_collision_meshes=True,
     )
 
-    # Get joint limits and link names (used for visualization)
-    lower_limits, upper_limits = get_joint_limits(urdf)
-    link_names = get_link_names(urdf)
-
     # Create Robot instance
     print("Analyzing robot structure...")
     t0 = time.perf_counter()
-    robot = ballpark.Robot(urdf_coll)
+    robot = Robot(urdf_coll)
     elapsed_ms = (time.perf_counter() - t0) * 1000
-    print(f"Found {len(robot.links)} links with collision geometry in {elapsed_ms:.1f}ms")
+    print(
+        f"Found {len(robot.collision_links)} links with collision geometry in {elapsed_ms:.1f}ms"
+    )
+
+    # Get joint limits and link names (used for visualization)
+    lower_limits, upper_limits = robot.joint_limits
+    link_names = robot.links
 
     # Set up viser server
     server = viser.ViserServer()
@@ -100,7 +102,7 @@ def main(
             link_sphere_sliders: dict[str, viser.GuiInputHandle] = {}
             per_link_folder = server.gui.add_folder("Per-Link", expand_by_default=False)
             with per_link_folder:
-                for link_name in robot.links:
+                for link_name in robot.collision_links:
                     display_name = (
                         link_name[:20] + "..." if len(link_name) > 20 else link_name
                     )
@@ -185,7 +187,7 @@ def main(
 
     def get_group_for_link(link_name: str) -> list[str] | None:
         """Find the similarity group containing a link."""
-        for group in robot.similarity.groups:
+        for group in robot._similarity.groups:
             if link_name in group:
                 return group
         return None
@@ -200,7 +202,10 @@ def main(
                 group = get_group_for_link(link_name)
                 if group is not None and len(group) > 1:
                     for other_link in group:
-                        if other_link != link_name and other_link in link_sphere_sliders:
+                        if (
+                            other_link != link_name
+                            and other_link in link_sphere_sliders
+                        ):
                             link_sphere_sliders[other_link].value = new_val
 
     def compute_spheres():
@@ -210,13 +215,17 @@ def main(
         if is_auto:
             total = int(total_spheres_slider.value)
             if total == 0:
-                link_spheres = {link_name: [] for link_name in urdf_coll.link_map.keys()}
-                current_link_budgets = {link_name: 0 for link_name in robot.links}
+                link_spheres = {
+                    link_name: [] for link_name in urdf_coll.link_map.keys()
+                }
+                current_link_budgets = {
+                    link_name: 0 for link_name in robot.collision_links
+                }
                 update_link_sliders_from_budgets(current_link_budgets)
                 return
 
             # Auto-allocate spheres
-            current_link_budgets = robot.allocate(total)
+            current_link_budgets = robot.auto_allocate(total)
             update_link_sliders_from_budgets(current_link_budgets)
 
             print(f"Computing spheres (auto, total={total})...")
@@ -227,7 +236,7 @@ def main(
             print(f"Computing spheres (manual, total={total})...")
 
         t0 = time.perf_counter()
-        result = robot.spherize(budgets=current_link_budgets)
+        result = robot.spherize(allocation=current_link_budgets)
         link_spheres = result.link_spheres
         elapsed_ms = (time.perf_counter() - t0) * 1000
         total_generated = sum(len(s) for s in link_spheres.values())
@@ -377,7 +386,7 @@ def main(
         urdf_vis.update_cfg(cfg)
 
         # Get link transforms and update sphere positions
-        Ts_link_world = get_link_transforms(urdf, cfg)
+        Ts_link_world = robot.compute_transforms(cfg)
         if show_spheres.value:
             update_sphere_transforms(Ts_link_world)
 
