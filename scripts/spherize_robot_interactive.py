@@ -54,6 +54,7 @@ def main(
 
     # Current sphere result (updated when settings change)
     result: RobotSpheresResult | None = None
+    target_spheres: int = 0
 
     def on_export() -> None:
         if result:
@@ -82,8 +83,8 @@ def main(
                 allocation = gui.manual_allocation
 
             # Generate spheres for each link
-            total = sum(allocation.values())
-            if total > 0:
+            target_spheres = gui.total_spheres
+            if target_spheres > 0:
                 t0 = time.perf_counter()
                 result = robot.spherize(allocation=allocation)
                 elapsed = (time.perf_counter() - t0) * 1000
@@ -99,6 +100,7 @@ def main(
                 result = RobotSpheresResult(link_spheres={})
 
             sphere_visuals.update(result, gui.opacity, gui.show_spheres)
+            gui.update_sphere_count(result.num_spheres)
             gui.mark_computed()
             gui.mark_visuals_updated()
 
@@ -162,15 +164,16 @@ class _SpheresGui:
                     "Mode", options=["Auto", "Manual"], initial_value="Auto"
                 )
                 self._total_spheres = server.gui.add_slider(
-                    "Total Spheres", min=0, max=100, step=1, initial_value=40
+                    "Target #", min=0, max=100, step=1, initial_value=40
+                )
+                self._sphere_count_number = server.gui.add_number(
+                    "Actual #", initial_value=0, disabled=True
                 )
                 self._link_sliders: dict[str, viser.GuiInputHandle] = {}
                 with server.gui.add_folder("Per-Link", expand_by_default=False):
                     for link_name in robot.collision_links:
                         display = (
-                            link_name[:20] + "..."
-                            if len(link_name) > 20
-                            else link_name
+                            link_name[:20] + "..." if len(link_name) > 20 else link_name
                         )
                         self._link_sliders[link_name] = server.gui.add_slider(
                             display,
@@ -315,6 +318,10 @@ class _SpheresGui:
 
     def on_export(self, callback: Callable[[], None]) -> None:
         self._export_callback = callback
+
+    def update_sphere_count(self, actual: int) -> None:
+        """Update the sphere count display."""
+        self._sphere_count_number.value = actual
 
 
 class _SphereVisuals:
