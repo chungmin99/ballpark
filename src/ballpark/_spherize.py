@@ -50,6 +50,7 @@ def spherize(
     """
     # Import here to avoid circular import
     from ._config import SpherizeParams
+    from ._symmetry import get_primitive_symmetry_planes, SymmetryInfo
 
     p = params or SpherizeParams()
 
@@ -61,8 +62,28 @@ def spherize(
     percentile = p.percentile
     max_radius_ratio = p.max_radius_ratio
     uniform_radius = p.uniform_radius
+    detect_symmetry = p.detect_symmetry
+    geometry_type = p.geometry_type
+    prefer_symmetric_splits = p.prefer_symmetric_splits
 
     points = cast(np.ndarray, mesh.sample(n_samples))
+
+    # Auto-enable symmetry detection for known primitives
+    symmetry_info: SymmetryInfo | None = None
+    if geometry_type in ("box", "cylinder") or (detect_symmetry and geometry_type != "sphere"):
+        if geometry_type in ("box", "cylinder"):
+            # Use known symmetry planes for primitives
+            symmetry_planes = get_primitive_symmetry_planes(points, geometry_type)
+            if symmetry_planes:
+                symmetry_info = SymmetryInfo(
+                    reflection_planes=symmetry_planes,
+                    rotation_axes=[],
+                    symmetry_score=1.0,
+                )
+        elif detect_symmetry:
+            # Fall back to general symmetry detection
+            from ._symmetry import detect_symmetry as detect_symmetry_fn
+            symmetry_info = detect_symmetry_fn(points, tolerance=p.symmetry_tolerance)
 
     # Compute max allowed radius
     bbox_diag = np.linalg.norm(points.max(axis=0) - points.min(axis=0)).item()
@@ -100,10 +121,32 @@ def spherize(
         if not should_split(pts, sphere, budget):
             return [sphere]
 
-        # Split along principal axis
-        pca = PCA(n_components=1)
-        pca.fit(pts)
-        proj = pts @ pca.components_[0]
+        # Choose split axis (prefer symmetry planes if available)
+        split_axis = None
+        if symmetry_info is not None and prefer_symmetric_splits and symmetry_info.preferred_split_axes:
+            # Use PCA to find principal direction
+            pca = PCA(n_components=1)
+            pca.fit(pts)
+            principal_axis = pca.components_[0]
+
+            # Find symmetry plane most aligned with principal direction
+            best_alignment = 0.0
+            for plane_normal in symmetry_info.preferred_split_axes:
+                alignment = abs(np.dot(principal_axis, plane_normal))
+                if alignment > best_alignment:
+                    best_alignment = alignment
+                    split_axis = plane_normal
+
+            # Only use symmetry plane if well-aligned (>70% alignment)
+            if best_alignment < 0.7:
+                split_axis = principal_axis
+        else:
+            # Standard PCA split
+            pca = PCA(n_components=1)
+            pca.fit(pts)
+            split_axis = pca.components_[0]
+
+        proj = pts @ split_axis
         # Blend median with geometric midpoint for more symmetric splits
         proj_mid = (proj.min() + proj.max()) / 2
         split_point = 0.5 * np.median(proj) + 0.5 * proj_mid
@@ -122,7 +165,23 @@ def spherize(
         if len(right) >= 10:
             result.extend(split(right, right_budget))
 
-        return result if result else [sphere]
+        if not result:
+            return [sphere]
+
+        # Backtracking: check if split improves quality
+        # Only perform this check if backtrack_threshold > 1.0 to avoid overhead
+        # Quality = coverage_fraction * (hull_volume / total_sphere_volume)
+        # Higher quality means better coverage with tighter fit
+        if p.backtrack_threshold > 1.0:
+            parent_quality = compute_split_quality(pts, [sphere])
+            children_quality = compute_split_quality(pts, result)
+
+            # If children don't improve enough, keep parent instead
+            # Example: threshold=1.05 requires 5% quality improvement to keep split
+            if children_quality < parent_quality * p.backtrack_threshold:
+                return [sphere]
+
+        return result
 
     spheres = split(points, target_spheres)
 
@@ -203,3 +262,70 @@ def compute_tightness(points: np.ndarray, sphere: Sphere) -> float:
         return float(sphere_vol / (hull_vol + 1e-10))
     except (QhullError, ValueError):
         return 1.0
+
+
+def compute_coverage(points: np.ndarray, spheres: list[Sphere]) -> float:
+    """Compute fraction of points inside at least one sphere.
+
+    Args:
+        points: (N, 3) array of points
+        spheres: List of spheres to check coverage
+
+    Returns:
+        Fraction of points covered (0.0 to 1.0)
+    """
+    if len(points) == 0 or len(spheres) == 0:
+        return 0.0
+
+    covered = np.zeros(len(points), dtype=bool)
+    for sphere in spheres:
+        center = np.asarray(sphere.center)
+        radius = float(sphere.radius)
+        dists = np.linalg.norm(points - center, axis=1)
+        covered |= dists <= radius
+
+    return float(covered.sum() / len(points))
+
+
+def compute_split_quality(points: np.ndarray, spheres: list[Sphere]) -> float:
+    """Compute combined quality metric for sphere decomposition.
+
+    Quality combines coverage and tightness:
+        quality = coverage_fraction * (hull_volume / total_sphere_volume)
+
+    Higher quality is better (more coverage, tighter fit).
+
+    Args:
+        points: (N, 3) array of points
+        spheres: List of spheres covering the points
+
+    Returns:
+        Quality score (higher is better). Returns 0.0 for degenerate cases.
+    """
+    if len(points) < 4 or len(spheres) == 0:
+        return 0.0
+
+    # Compute coverage fraction
+    coverage = compute_coverage(points, spheres)
+
+    # Compute hull volume (with error handling)
+    try:
+        hull_vol = ConvexHull(points).volume
+    except (QhullError, ValueError):
+        # Degenerate hull - can't compute meaningful quality
+        return 0.0
+
+    # Compute total sphere volume
+    total_sphere_vol = sum(
+        4 / 3 * np.pi * float(sphere.radius) ** 3 for sphere in spheres
+    )
+
+    # Avoid division by zero
+    if total_sphere_vol < 1e-10:
+        return 0.0
+
+    # Quality = coverage * inverse_tightness
+    # Higher coverage and tighter fit (hull/sphere closer to 1) = higher quality
+    quality = coverage * (hull_vol / total_sphere_vol)
+
+    return float(quality)

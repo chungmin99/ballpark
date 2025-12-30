@@ -51,6 +51,64 @@ class SpherizeParams:
     uniform_radius: bool = False
     """If True, post-process to make radii more uniform."""
 
+    # Configurable point thresholds (Issue 3)
+    min_points_to_split: int = 20
+    """Minimum points in a region to consider splitting."""
+
+    min_points_for_sphere: int = 10
+    """Minimum points required to generate a valid sphere."""
+
+    min_points_base_case: int = 15
+    """Points below this threshold trigger base case (no further splitting)."""
+
+    # Parent-relative max radius (Issue 8)
+    max_radius_decay: float = 0.8
+    """Child sphere max radius as fraction of parent radius."""
+
+    max_radius_absolute_floor: float = 0.01
+    """Absolute minimum max_radius as fraction of bbox diagonal."""
+
+    # Symmetry detection
+    detect_symmetry: bool = False
+    """Whether to detect and respect point cloud symmetry.
+
+    Disabled by default as it can reduce coverage for non-axis-aligned shapes.
+    Enable for highly symmetric primitives like cubes.
+    """
+
+    symmetry_tolerance: float = 0.02
+    """Relative tolerance for symmetry detection."""
+
+    prefer_symmetric_splits: bool = True
+    """Prefer splits along detected symmetry planes."""
+
+    symmetry_budget_tolerance: float = 1.1
+    """Allow up to 10% budget overage to maintain symmetry."""
+
+    geometry_type: str | None = None
+    """Geometry primitive type: 'box', 'cylinder', 'sphere', 'mesh', or None.
+
+    When set to a known primitive type, automatically enables symmetry detection
+    with appropriate symmetry planes for that primitive. This is primarily used
+    internally when spherizing robot collision geometry.
+    """
+
+    # Quality control (Issue 7)
+    backtrack_threshold: float = 1.0
+    """Required improvement ratio for children vs parent to justify split.
+
+    Quality = coverage_fraction * (hull_volume / total_sphere_volume)
+    Higher quality means better coverage with tighter fit.
+
+    1.0  = no backtracking (always split if thresholds exceeded)
+    1.02 = require 2% quality improvement (conservative, recommended)
+    1.05 = require 5% quality improvement (moderate)
+    1.10 = require 10% quality improvement (aggressive, may under-split)
+
+    Backtracking prevents over-splitting when splits don't improve quality.
+    Start with 1.02-1.05 for most applications.
+    """
+
 
 @jdc.pytree_dataclass
 class RefineParams:
@@ -155,6 +213,17 @@ _PRESET_CONFIGS: dict[SpherePreset, BallparkConfig] = {
             percentile=99.0,  # Use more of the points
             max_radius_ratio=0.4,  # Smaller max spheres
             uniform_radius=False,
+            # Tighter thresholds for surface mode
+            min_points_to_split=15,
+            min_points_for_sphere=8,
+            min_points_base_case=12,
+            max_radius_decay=0.75,
+            max_radius_absolute_floor=0.005,
+            detect_symmetry=True,
+            symmetry_tolerance=0.015,
+            prefer_symmetric_splits=True,
+            symmetry_budget_tolerance=1.05,
+            backtrack_threshold=1.0,
         ),
         refine=RefineParams(
             lambda_under=2.0,  # Prioritize coverage
@@ -189,6 +258,17 @@ _PRESET_CONFIGS: dict[SpherePreset, BallparkConfig] = {
             percentile=95.0,  # Ignore more outliers
             max_radius_ratio=0.6,  # Allow larger spheres
             uniform_radius=True,  # More uniform sizes
+            # Looser thresholds for conservative mode
+            min_points_to_split=30,
+            min_points_for_sphere=15,
+            min_points_base_case=20,
+            max_radius_decay=0.85,
+            max_radius_absolute_floor=0.02,
+            detect_symmetry=False,  # Simpler behavior
+            symmetry_tolerance=0.03,
+            prefer_symmetric_splits=False,
+            symmetry_budget_tolerance=1.15,
+            backtrack_threshold=1.05,
         ),
         refine=RefineParams(
             lambda_under=0.5,  # Less strict on coverage

@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from pathlib import Path
+from typing import Any
 
 import numpy as np
 import trimesh
@@ -67,13 +68,15 @@ class Robot:
         ]
 
         # Cache collision meshes for all collision links
-        self._link_meshes: dict[str, trimesh.Trimesh] = {
-            link_name: self._get_collision_mesh_for_link(link_name)
-            for link_name in self._links
-        }
+        self._link_meshes: dict[str, trimesh.Trimesh] = {}
+        self._link_geometry_types: dict[str, str] = {}
+        for link_name in self._links:
+            mesh, geom_type = self._get_collision_mesh_for_link(link_name)
+            self._link_meshes[link_name] = mesh
+            self._link_geometry_types[link_name] = geom_type
 
         # Cache collision fingerprints for similarity detection
-        self._link_fingerprints: dict[str, tuple] = {
+        self._link_fingerprints: dict[str, tuple[Any, ...]] = {
             link_name: get_link_collision_fingerprint(urdf, link_name)
             for link_name in self._links
         }
@@ -190,17 +193,24 @@ class Robot:
                     pairs.append((link_a, link_b))
         return pairs
 
-    def _get_collision_mesh_for_link(self, link_name: str) -> trimesh.Trimesh:
-        """Extract collision mesh for a given link from URDF."""
+    def _get_collision_mesh_for_link(self, link_name: str) -> tuple[trimesh.Trimesh, str]:
+        """Extract collision mesh for a given link from URDF.
+
+        Returns:
+            Tuple of (mesh, geometry_type) where geometry_type is one of:
+            'box', 'cylinder', 'sphere', 'mesh', or 'mixed'
+        """
         if link_name not in self._urdf.link_map:
-            return trimesh.Trimesh()
+            return trimesh.Trimesh(), "mesh"
 
         link = self._urdf.link_map[link_name]
         coll_meshes = []
+        geom_types = []
 
         for collision in link.collisions:
             geom = collision.geometry
             mesh = None
+            geom_type = "mesh"
 
             if collision.origin is not None:
                 transform = collision.origin
@@ -209,12 +219,15 @@ class Robot:
 
             if geom.box is not None:
                 mesh = trimesh.creation.box(extents=geom.box.size)
+                geom_type = "box"
             elif geom.cylinder is not None:
                 mesh = trimesh.creation.cylinder(
                     radius=geom.cylinder.radius, height=geom.cylinder.length
                 )
+                geom_type = "cylinder"
             elif geom.sphere is not None:
                 mesh = trimesh.creation.icosphere(radius=geom.sphere.radius)
+                geom_type = "sphere"
             elif geom.mesh is not None:
                 mesh_path = geom.mesh.filename
                 # Resolve package:// URLs using URDF's filename handler
@@ -244,6 +257,7 @@ class Robot:
                     if geom.mesh.scale is not None:
                         scale = np.asarray(geom.mesh.scale)
                         mesh.apply_scale(scale)
+                    geom_type = "mesh"
                 except Exception as e:
                     logger.warning(f"Failed to load mesh {mesh_path}: {e}")
                     continue
@@ -251,11 +265,18 @@ class Robot:
             if mesh is not None:
                 mesh.apply_transform(transform)
                 coll_meshes.append(mesh)
+                geom_types.append(geom_type)
 
         if not coll_meshes:
-            return trimesh.Trimesh()
+            return trimesh.Trimesh(), "mesh"
 
-        return trimesh.util.concatenate(coll_meshes)
+        # Determine final geometry type
+        if len(set(geom_types)) == 1:
+            final_geom_type = geom_types[0]
+        else:
+            final_geom_type = "mixed"
+
+        return trimesh.util.concatenate(coll_meshes), final_geom_type
 
     # =========================================================================
     # Public methods
@@ -396,6 +417,7 @@ class Robot:
             link_budgets=allocation,
             similarity_result=self._similarity,
             spherize_params=cfg.spherize,
+            link_geometry_types=self._link_geometry_types,
         )
 
     def refine(
@@ -551,6 +573,7 @@ def _compute_spheres_for_robot(
     link_budgets: dict[str, int],
     similarity_result: SimilarityResult | None = None,
     spherize_params: SpherizeParams | None = None,
+    link_geometry_types: dict[str, str] | None = None,
 ) -> RobotSpheresResult:
     """
     Compute spheres for all links.
@@ -561,10 +584,13 @@ def _compute_spheres_for_robot(
         link_budgets: Dict mapping link names to sphere counts
         similarity_result: Optional similarity info for reusing spheres
         spherize_params: Parameters for the spherization algorithm
+        link_geometry_types: Optional dict mapping link names to geometry types
 
     Returns:
         RobotSpheresResult with link_spheres
     """
+    import jax_dataclasses as jdc
+
     params = spherize_params or SpherizeParams()
     link_spheres: dict[str, list[Sphere]] = {}
 
@@ -598,7 +624,14 @@ def _compute_spheres_for_robot(
             link_spheres[link_name] = []
             continue
 
-        link_spheres[link_name] = spherize(mesh, budget, params)
+        # Set geometry type for this link (enables primitive-aware symmetry)
+        link_params = params
+        if link_geometry_types is not None:
+            geom_type = link_geometry_types.get(link_name)
+            if geom_type is not None:
+                link_params = jdc.replace(params, geometry_type=geom_type)
+
+        link_spheres[link_name] = spherize(mesh, budget, link_params)
 
     return RobotSpheresResult(link_spheres=link_spheres)
 
