@@ -162,11 +162,49 @@ class Robot:
 
         return allocation
 
+    def _sync_similar_allocations(
+        self, allocation: dict[str, int]
+    ) -> dict[str, int]:
+        """
+        Sync allocations for similar links to the maximum count in each group.
+
+        Args:
+            allocation: Per-link sphere allocation
+
+        Returns:
+            New allocation dict with similar links synced to max count
+        """
+        synced = dict(allocation)
+
+        for group in self._similarity.groups:
+            # Get counts for links in this group that have allocations
+            group_counts = {
+                link: synced.get(link, 0) for link in group if link in synced
+            }
+            if len(group_counts) < 2:
+                continue
+
+            max_count = max(group_counts.values())
+            links_to_sync = [
+                link for link, count in group_counts.items() if count < max_count
+            ]
+
+            if links_to_sync:
+                logger.warning(
+                    f"Syncing similar links to max count {max_count}: "
+                    f"{links_to_sync} (was {[group_counts[l] for l in links_to_sync]})"
+                )
+                for link in links_to_sync:
+                    synced[link] = max_count
+
+        return synced
+
     def spherize(
         self,
         target_spheres: int | None = None,
         allocation: dict[str, int] | None = None,
         config: BallparkConfig | None = None,
+        sync_similar: bool = True,
     ) -> RobotSpheresResult:
         """
         Generate spheres for the robot.
@@ -175,6 +213,8 @@ class Robot:
             target_spheres: Total spheres (auto-allocates). Mutually exclusive with allocation.
             allocation: Explicit per-link allocation. Mutually exclusive with target_spheres.
             config: Configuration for spherization. If None, uses BALANCED preset.
+            sync_similar: If True and allocation is provided, sync similar links to the
+                highest count in each similarity group (with warning). Default True.
 
         Returns:
             RobotSpheresResult with link_spheres
@@ -190,6 +230,8 @@ class Robot:
         if allocation is None:
             assert target_spheres is not None
             allocation = self.auto_allocate(target_spheres)
+        elif sync_similar:
+            allocation = self._sync_similar_allocations(allocation)
 
         return _compute_spheres_for_robot(
             self.urdf,
