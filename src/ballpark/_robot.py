@@ -6,6 +6,8 @@ from dataclasses import dataclass
 from pathlib import Path
 
 import numpy as np
+import trimesh
+from scipy.spatial.transform import Rotation
 
 from loguru import logger
 
@@ -13,14 +15,7 @@ from ._config import BallparkConfig, SpherePreset, SpherizeParams
 from ._spherize import Sphere, spherize
 from ._similarity import SimilarityResult, detect_similar_links
 from ._refine import _refine_robot_spheres, _compute_min_self_collision_distance
-
-from .utils._urdf_utils import (
-    get_collision_mesh_for_link,
-    get_joint_limits,
-    get_link_names,
-    get_link_transforms,
-    link_has_collision,
-)
+from .utils._hash_geometry import get_link_collision_fingerprint
 
 
 @dataclass
@@ -59,23 +54,47 @@ class Robot:
         Args:
             urdf: yourdfpy URDF object with collision meshes loaded
         """
-        self.urdf = urdf
+        self._urdf = urdf
+
+        # Cache all link names (ordered)
+        self._all_link_names: list[str] = list(urdf.link_map.keys())
 
         # Compute links with collision geometry
         self._links = [
             link_name
-            for link_name in urdf.link_map.keys()
-            if link_has_collision(urdf, link_name)
+            for link_name in self._all_link_names
+            if self._link_has_collision(link_name)
         ]
 
-        # Compute similarity
-        self._similarity = detect_similar_links(urdf, self._links)
+        # Cache collision meshes for all collision links
+        self._link_meshes: dict[str, trimesh.Trimesh] = {
+            link_name: self._get_collision_mesh_for_link(link_name)
+            for link_name in self._links
+        }
+
+        # Cache collision fingerprints for similarity detection
+        self._link_fingerprints: dict[str, tuple] = {
+            link_name: get_link_collision_fingerprint(urdf, link_name)
+            for link_name in self._links
+        }
+
+        # Compute non-contiguous pairs for self-collision checking
+        self._non_contiguous_pairs = self._get_non_contiguous_link_pairs(self._links)
+
+        # Compute similarity using cached data
+        self._similarity = detect_similar_links(
+            self._link_meshes, self._link_fingerprints
+        )
 
         # Log robot summary
         logger.info(
             f"Robot: {len(self._links)} collision links, "
             f"{len(self._similarity.groups)} similarity group(s)"
         )
+
+    # =========================================================================
+    # Public properties
+    # =========================================================================
 
     @property
     def collision_links(self) -> list[str]:
@@ -85,12 +104,12 @@ class Robot:
     @property
     def links(self) -> list[str]:
         """All link names in the URDF."""
-        return get_link_names(self.urdf)
+        return self._all_link_names
 
     @property
     def joint_limits(self) -> tuple[np.ndarray, np.ndarray]:
         """Joint limits as (lower, upper) arrays."""
-        return get_joint_limits(self.urdf)
+        return self._get_joint_limits()
 
     def compute_transforms(self, cfg: np.ndarray) -> np.ndarray:
         """
@@ -102,7 +121,143 @@ class Robot:
         Returns:
             (num_links, 7) array where each row is [qw, qx, qy, qz, x, y, z]
         """
-        return get_link_transforms(self.urdf, cfg)
+        return self._get_link_transforms(cfg)
+
+    # =========================================================================
+    # Private URDF utility methods (inlined from _urdf_utils)
+    # =========================================================================
+
+    def _link_has_collision(self, link_name: str) -> bool:
+        """Check if a link has collision geometry."""
+        if link_name not in self._urdf.link_map:
+            return False
+        return len(self._urdf.link_map[link_name].collisions) > 0
+
+    def _get_joint_limits(self) -> tuple[np.ndarray, np.ndarray]:
+        """Get joint limits from URDF."""
+        lower = []
+        upper = []
+        for jname in self._urdf.actuated_joint_names:
+            joint = self._urdf.joint_map[jname]
+            lower.append(joint.limit.lower if joint.limit else -np.pi)
+            upper.append(joint.limit.upper if joint.limit else np.pi)
+        return np.array(lower), np.array(upper)
+
+    def _get_link_transforms(self, joint_cfg: np.ndarray) -> np.ndarray:
+        """Compute forward kinematics for all links."""
+        # Update URDF configuration (does FK internally)
+        self._urdf.update_cfg(joint_cfg)
+
+        # Get transforms for all links
+        transforms = np.zeros((len(self._all_link_names), 7))
+
+        for i, link_name in enumerate(self._all_link_names):
+            # Get 4x4 homogeneous transform
+            T = self._urdf.get_transform(link_name)
+
+            # Extract rotation matrix and convert to quaternion (wxyz format)
+            rot_matrix = T[:3, :3]
+            quat_xyzw = Rotation.from_matrix(rot_matrix).as_quat()  # scipy uses xyzw
+            quat_wxyz = np.array([quat_xyzw[3], quat_xyzw[0], quat_xyzw[1], quat_xyzw[2]])
+
+            # Extract translation
+            translation = T[:3, 3]
+
+            transforms[i, :4] = quat_wxyz
+            transforms[i, 4:] = translation
+
+        return transforms
+
+    def _get_adjacent_links(self) -> set[tuple[str, str]]:
+        """Build adjacency set from joint parent-child relationships."""
+        adjacent = set()
+        for joint in self._urdf.robot.joints:
+            pair = tuple(sorted([joint.parent, joint.child]))
+            adjacent.add(pair)
+        return adjacent
+
+    def _get_non_contiguous_link_pairs(
+        self, link_names: list[str]
+    ) -> list[tuple[str, str]]:
+        """Get all link pairs that are NOT adjacent (for self-collision checking)."""
+        adjacent = self._get_adjacent_links()
+        pairs = []
+        for i, link_a in enumerate(link_names):
+            for link_b in link_names[i + 1 :]:
+                if tuple(sorted([link_a, link_b])) not in adjacent:
+                    pairs.append((link_a, link_b))
+        return pairs
+
+    def _get_collision_mesh_for_link(self, link_name: str) -> trimesh.Trimesh:
+        """Extract collision mesh for a given link from URDF."""
+        if link_name not in self._urdf.link_map:
+            return trimesh.Trimesh()
+
+        link = self._urdf.link_map[link_name]
+        coll_meshes = []
+
+        for collision in link.collisions:
+            geom = collision.geometry
+            mesh = None
+
+            if collision.origin is not None:
+                transform = collision.origin
+            else:
+                transform = np.eye(4)
+
+            if geom.box is not None:
+                mesh = trimesh.creation.box(extents=geom.box.size)
+            elif geom.cylinder is not None:
+                mesh = trimesh.creation.cylinder(
+                    radius=geom.cylinder.radius, height=geom.cylinder.length
+                )
+            elif geom.sphere is not None:
+                mesh = trimesh.creation.icosphere(radius=geom.sphere.radius)
+            elif geom.mesh is not None:
+                mesh_path = geom.mesh.filename
+                # Resolve package:// URLs using URDF's filename handler
+                if (
+                    hasattr(self._urdf, "_filename_handler")
+                    and self._urdf._filename_handler is not None
+                ):
+                    mesh_path = self._urdf._filename_handler(mesh_path)
+                try:
+                    loaded_obj = trimesh.load(
+                        mesh_path,
+                        force="mesh",
+                        process=False,
+                    )
+                    if isinstance(loaded_obj, trimesh.Scene):
+                        mesh = loaded_obj.dump(concatenate=True)
+                    else:
+                        mesh = loaded_obj
+
+                    # Ensure mesh is a Trimesh (not a list)
+                    if not isinstance(mesh, trimesh.Trimesh):
+                        logger.warning(
+                            f"Unexpected mesh type from {mesh_path}: {type(mesh)}"
+                        )
+                        continue
+
+                    if geom.mesh.scale is not None:
+                        scale = np.asarray(geom.mesh.scale)
+                        mesh.apply_scale(scale)
+                except Exception as e:
+                    logger.warning(f"Failed to load mesh {mesh_path}: {e}")
+                    continue
+
+            if mesh is not None:
+                mesh.apply_transform(transform)
+                coll_meshes.append(mesh)
+
+        if not coll_meshes:
+            return trimesh.Trimesh()
+
+        return trimesh.util.concatenate(coll_meshes)
+
+    # =========================================================================
+    # Public methods
+    # =========================================================================
 
     def auto_allocate(
         self,
@@ -147,7 +302,7 @@ class Robot:
                 primary_multiplier[link] = 1
 
         allocation = _allocate_spheres_for_robot(
-            self.urdf,
+            self._link_meshes,
             primary_links,
             target_spheres=target_spheres,
             min_per_link=min_per_link,
@@ -234,7 +389,7 @@ class Robot:
             allocation = self._sync_similar_allocations(allocation)
 
         return _compute_spheres_for_robot(
-            self.urdf,
+            self._link_meshes,
             self._links,
             link_budgets=allocation,
             similarity_result=self._similarity,
@@ -263,8 +418,12 @@ class Robot:
         cfg = config or BallparkConfig.from_preset(SpherePreset.BALANCED)
 
         refined_link_spheres = _refine_robot_spheres(
-            self.urdf,
             spheres_result.link_spheres,
+            self._link_meshes,
+            self._all_link_names,
+            self.joint_limits,
+            self.compute_transforms,
+            self._non_contiguous_pairs,
             self._similarity,
             refine_params=cfg.refine,
         )
@@ -289,14 +448,17 @@ class Robot:
             Minimum signed distance. Negative = collision, positive = clearance.
         """
         return _compute_min_self_collision_distance(
-            self.urdf,
             spheres_result.link_spheres,
+            self._all_link_names,
+            self.joint_limits,
+            self.compute_transforms,
+            self._non_contiguous_pairs,
             joint_cfg=joint_cfg,
         )
 
 
 def _allocate_spheres_for_robot(
-    urdf,
+    link_meshes: dict[str, trimesh.Trimesh],
     links: list[str],
     target_spheres: int,
     min_per_link: int = 1,
@@ -310,7 +472,7 @@ def _allocate_spheres_for_robot(
     get more spheres.
 
     Args:
-        urdf: yourdfpy URDF object
+        link_meshes: Dict mapping link names to their collision meshes.
         links: List of link names to allocate for
         target_spheres: Total number of spheres in final output
         min_per_link: Minimum spheres per link
@@ -326,8 +488,8 @@ def _allocate_spheres_for_robot(
     # Compute weights based on sphere inefficiency
     weights = {}
     for link_name in links:
-        mesh = get_collision_mesh_for_link(urdf, link_name)
-        if not mesh.is_empty:
+        mesh = link_meshes.get(link_name)
+        if mesh is not None and not mesh.is_empty:
             # Bounding sphere radius (half of bbox diagonal)
             bbox_diag = np.linalg.norm(mesh.extents)
             bounding_sphere_radius = bbox_diag / 2
@@ -382,7 +544,7 @@ def _allocate_spheres_for_robot(
 
 
 def _compute_spheres_for_robot(
-    urdf,
+    link_meshes: dict[str, trimesh.Trimesh],
     links: list[str],
     link_budgets: dict[str, int],
     similarity_result: SimilarityResult | None = None,
@@ -392,7 +554,7 @@ def _compute_spheres_for_robot(
     Compute spheres for all links.
 
     Args:
-        urdf: yourdfpy URDF object
+        link_meshes: Dict mapping link names to their collision meshes.
         links: List of link names
         link_budgets: Dict mapping link names to sphere counts
         similarity_result: Optional similarity info for reusing spheres
@@ -429,8 +591,8 @@ def _compute_spheres_for_robot(
                     continue
 
         # Spherize this link
-        mesh = get_collision_mesh_for_link(urdf, link_name)
-        if mesh.is_empty:
+        mesh = link_meshes.get(link_name)
+        if mesh is None or mesh.is_empty:
             link_spheres[link_name] = []
             continue
 

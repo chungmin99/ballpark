@@ -3,17 +3,12 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from typing import Callable
 
 import numpy as np
+import trimesh
 from scipy.spatial import cKDTree
 from scipy.spatial.transform import Rotation as R
-
-from ._urdf_utils import (
-    get_collision_mesh_for_link,
-    get_joint_limits,
-    get_link_names,
-    get_link_transforms,
-)
 
 
 @dataclass
@@ -73,24 +68,20 @@ def bbox_distance(
 
 
 def precompute_link_mesh_data(
-    urdf,
-    link_names: list[str],
+    link_meshes: dict[str, trimesh.Trimesh],
     n_samples: int = 1000,
 ) -> dict[str, LinkMeshData]:
-    """Precompute mesh data for all links (load once, sample once).
+    """Precompute mesh data for all links (sample once).
 
     Args:
-        urdf: yourdfpy URDF object
-        link_names: List of link names to precompute
+        link_meshes: Dict mapping link names to their collision meshes.
         n_samples: Number of surface samples per link
 
     Returns:
         Dict mapping link names to LinkMeshData
     """
     link_data = {}
-    for link_name in link_names:
-        mesh = get_collision_mesh_for_link(urdf, link_name)
-
+    for link_name, mesh in link_meshes.items():
         if mesh.is_empty:
             link_data[link_name] = LinkMeshData(
                 sampled_points=np.zeros((0, 3)),
@@ -154,8 +145,11 @@ def transform_link_points_to_world(
 
 
 def compute_mesh_distances_batch(
-    urdf,
+    link_meshes: dict[str, trimesh.Trimesh],
     link_pairs: list[tuple[str, str]],
+    all_link_names: list[str],
+    joint_limits: tuple[np.ndarray, np.ndarray],
+    compute_transforms: Callable[[np.ndarray], np.ndarray],
     n_samples: int = 1000,
     bbox_skip_threshold: float = 0.1,
     joint_cfg: np.ndarray | None = None,
@@ -165,8 +159,11 @@ def compute_mesh_distances_batch(
     Uses bounding box checks to skip distant pairs.
 
     Args:
-        urdf: yourdfpy URDF object
+        link_meshes: Dict mapping link names to their collision meshes.
         link_pairs: List of (link_a, link_b) pairs to check
+        all_link_names: Ordered list of all link names (for FK index mapping).
+        joint_limits: Tuple of (lower_limits, upper_limits) arrays.
+        compute_transforms: Function that takes joint_cfg and returns (N, 7) transforms.
         n_samples: Surface samples per link for distance computation
         bbox_skip_threshold: Skip detailed check if bbox distance exceeds this
         joint_cfg: Joint configuration for FK. If None, uses middle of limits.
@@ -182,14 +179,15 @@ def compute_mesh_distances_batch(
         unique_links.add(link_a)
         unique_links.add(link_b)
 
-    link_data = precompute_link_mesh_data(urdf, list(unique_links), n_samples)
+    # Filter meshes to only those needed
+    relevant_meshes = {k: v for k, v in link_meshes.items() if k in unique_links}
+    link_data = precompute_link_mesh_data(relevant_meshes, n_samples)
 
-    link_names = get_link_names(urdf)
-    link_name_to_idx = {name: idx for idx, name in enumerate(link_names)}
+    link_name_to_idx = {name: idx for idx, name in enumerate(all_link_names)}
     if joint_cfg is None:
-        lower, upper = get_joint_limits(urdf)
+        lower, upper = joint_limits
         joint_cfg = (lower + upper) / 2
-    Ts = get_link_transforms(urdf, joint_cfg)
+    Ts = compute_transforms(joint_cfg)
 
     world_points, world_bbox_min, world_bbox_max = transform_link_points_to_world(
         link_data, Ts, link_name_to_idx

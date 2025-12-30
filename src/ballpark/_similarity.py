@@ -10,10 +10,10 @@ from dataclasses import dataclass, field
 from collections import defaultdict
 
 import numpy as np
+import trimesh
 from loguru import logger
 
-from .utils._hash_geometry import get_link_collision_fingerprint, _get_geometry_fingerprint
-from .utils._urdf_utils import get_collision_mesh_for_link
+from .utils._hash_geometry import _get_geometry_fingerprint
 
 
 @dataclass
@@ -76,8 +76,8 @@ def _compute_alignment_transform(mesh_a, mesh_b) -> np.ndarray:
 
 
 def detect_similar_links(
-    urdf,
-    link_names: list[str] | None = None,
+    link_meshes: dict[str, trimesh.Trimesh],
+    link_fingerprints: dict[str, tuple],
 ) -> SimilarityResult:
     """Detect links with duplicate/similar collision meshes.
 
@@ -88,29 +88,29 @@ def detect_similar_links(
     cached and passed to compute_spheres_for_robot() to avoid recomputation.
 
     Args:
-        urdf: yourdfpy URDF object with collision meshes loaded
-        link_names: Optional list of links to consider. If None, uses all links.
+        link_meshes: Dict mapping link names to their collision meshes.
+        link_fingerprints: Dict mapping link names to collision fingerprints
+            (pre-computed from URDF collision geometry).
 
     Returns:
         SimilarityResult containing groups of similar links and transforms
         between them.
 
     Example:
-        >>> similarity = detect_similar_links(urdf)
+        >>> similarity = detect_similar_links(link_meshes, link_fingerprints)
         Similarity: 1 group(s), 3 links share geometry
           Group 1: finger_link_1 -> finger_link_2, finger_link_3
         >>> print(similarity.groups)
         [['finger_link_1', 'finger_link_2', 'finger_link_3']]
     """
-    if link_names is None:
-        link_names = list(urdf.link_map.keys())
+    link_names = list(link_meshes.keys())
 
     # Step 1: Group links by fingerprint
     fingerprint_to_links: dict[tuple, list[str]] = defaultdict(list)
 
     for link_name in link_names:
-        fp = get_link_collision_fingerprint(urdf, link_name)
-        if fp is not None:
+        fp = link_fingerprints.get(link_name)
+        if fp:
             fingerprint_to_links[fp].append(link_name)
 
     # Step 2: Build groups (only include groups with 2+ links)
@@ -124,17 +124,20 @@ def detect_similar_links(
     # Step 2b: Geometry-based grouping for mesh-file links not yet grouped
     ungrouped_mesh_links = [
         link
-        for link, fp in ((l, get_link_collision_fingerprint(urdf, l)) for l in link_names)
-        if fp and link not in grouped_links and any(f[0] == "mesh_file" for f in fp)
+        for link in link_names
+        if link not in grouped_links
+        and link_fingerprints.get(link)
+        and any(f[0] == "mesh_file" for f in link_fingerprints[link])
     ]
 
     if ungrouped_mesh_links:
         geom_fp_to_links: dict[tuple, list[str]] = defaultdict(list)
         for link_name in ungrouped_mesh_links:
-            mesh = get_collision_mesh_for_link(urdf, link_name)
-            gfp = _get_geometry_fingerprint(mesh)
-            if gfp:
-                geom_fp_to_links[gfp].append(link_name)
+            mesh = link_meshes.get(link_name)
+            if mesh is not None and not mesh.is_empty:
+                gfp = _get_geometry_fingerprint(mesh)
+                if gfp:
+                    geom_fp_to_links[gfp].append(link_name)
 
         for gfp, links in geom_fp_to_links.items():
             if len(links) >= 2:
@@ -155,12 +158,12 @@ def detect_similar_links(
     transforms: dict[tuple[str, str], np.ndarray] = {}
 
     for group in groups:
-        # Load meshes for this group
-        meshes = {}
-        for link_name in group:
-            mesh = get_collision_mesh_for_link(urdf, link_name)
-            if not mesh.is_empty:
-                meshes[link_name] = mesh
+        # Get meshes for this group
+        meshes = {
+            link_name: link_meshes[link_name]
+            for link_name in group
+            if link_name in link_meshes and not link_meshes[link_name].is_empty
+        }
 
         # Compute pairwise transforms (only need from first link to others)
         if len(meshes) >= 2:

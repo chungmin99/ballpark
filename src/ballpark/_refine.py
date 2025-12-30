@@ -2,7 +2,10 @@
 
 from __future__ import annotations
 
+from typing import Callable
+
 import numpy as np
+import trimesh
 import jax
 import jax.numpy as jnp
 from jax import lax
@@ -15,13 +18,6 @@ from scipy.optimize import linear_sum_assignment
 from ._spherize import Sphere
 from ._similarity import SimilarityResult
 from ._config import RefineParams
-from .utils._urdf_utils import (
-    get_collision_mesh_for_link,
-    get_joint_limits,
-    get_link_transforms,
-    get_link_names,
-    get_non_contiguous_link_pairs,
-)
 from .utils._mesh_utils import compute_mesh_distances_batch
 
 
@@ -80,13 +76,28 @@ class RobotRefineContext:
 
 
 def _compute_min_self_collision_distance(
-    urdf,
     link_spheres: dict[str, list[Sphere]],
+    all_link_names: list[str],
+    joint_limits: tuple[np.ndarray, np.ndarray],
+    compute_transforms: Callable[[np.ndarray], np.ndarray],
+    non_contiguous_pairs: list[tuple[str, str]],
     valid_pairs: list[tuple[str, str]] | None = None,
     joint_cfg: np.ndarray | None = None,
 ) -> float:
-    """Compute the minimum signed distance between spheres of non-contiguous links."""
-    all_link_names = get_link_names(urdf)
+    """Compute the minimum signed distance between spheres of non-contiguous links.
+
+    Args:
+        link_spheres: Dict mapping link names to lists of Sphere objects.
+        all_link_names: Ordered list of all link names.
+        joint_limits: Tuple of (lower_limits, upper_limits) arrays.
+        compute_transforms: Function that takes joint_cfg and returns (N, 7) transforms.
+        non_contiguous_pairs: List of (link_a, link_b) pairs that are not adjacent.
+        valid_pairs: If provided, only check these pairs instead of non_contiguous_pairs.
+        joint_cfg: Joint configuration for FK. If None, uses middle of limits.
+
+    Returns:
+        Minimum signed distance. Negative = collision, positive = clearance.
+    """
     links_with_spheres = [name for name in all_link_names if link_spheres.get(name)]
     if not links_with_spheres:
         return float("inf")
@@ -94,18 +105,15 @@ def _compute_min_self_collision_distance(
     link_name_to_idx = {name: idx for idx, name in enumerate(all_link_names)}
 
     if joint_cfg is None:
-        lower, upper = get_joint_limits(urdf)
+        lower, upper = joint_limits
         joint_cfg = (lower + upper) / 2
-    Ts = get_link_transforms(urdf, joint_cfg)
+    Ts = compute_transforms(joint_cfg)
 
-    if valid_pairs is not None:
-        non_contiguous_pairs = valid_pairs
-    else:
-        non_contiguous_pairs = get_non_contiguous_link_pairs(urdf, links_with_spheres)
+    pairs_to_check = valid_pairs if valid_pairs is not None else non_contiguous_pairs
 
     min_dist = float("inf")
 
-    for link_a, link_b in non_contiguous_pairs:
+    for link_a, link_b in pairs_to_check:
         spheres_a = link_spheres.get(link_a, [])
         spheres_b = link_spheres.get(link_b, [])
 
@@ -620,8 +628,12 @@ def _run_robot_optimization(
 
 
 def _refine_robot_spheres(
-    urdf,
     link_spheres: dict[str, list[Sphere]],
+    link_meshes: dict[str, trimesh.Trimesh],
+    all_link_names: list[str],
+    joint_limits: tuple[np.ndarray, np.ndarray],
+    compute_transforms: Callable[[np.ndarray], np.ndarray],
+    non_contiguous_pairs: list[tuple[str, str]],
     similarity_result: SimilarityResult | None,
     refine_params: RefineParams | None = None,
 ) -> dict[str, list[Sphere]]:
@@ -631,9 +643,13 @@ def _refine_robot_spheres(
     This is the internal entry point called by Robot.refine().
 
     Args:
-        urdf: yourdfpy URDF object with collision meshes loaded
-        link_spheres: Dict mapping link names to lists of Sphere objects
-        similarity_result: Result from detect_similar_links() for similarity regularization
+        link_spheres: Dict mapping link names to lists of Sphere objects.
+        link_meshes: Dict mapping link names to their collision meshes.
+        all_link_names: Ordered list of all link names.
+        joint_limits: Tuple of (lower_limits, upper_limits) arrays.
+        compute_transforms: Function that takes joint_cfg and returns (N, 7) transforms.
+        non_contiguous_pairs: List of (link_a, link_b) pairs that are not adjacent.
+        similarity_result: Result from detect_similar_links() for similarity regularization.
         refine_params: Refinement parameters. If None, uses defaults.
 
     Returns:
@@ -643,8 +659,7 @@ def _refine_robot_spheres(
     p = refine_params or RefineParams()
     joint_cfg = None  # Use middle of limits by default
 
-    # Get link names
-    all_link_names = get_link_names(urdf)
+    # Get link names with spheres
     link_names = [name for name in all_link_names if link_spheres.get(name)]
     if not link_names:
         return link_spheres
@@ -653,15 +668,15 @@ def _refine_robot_spheres(
 
     # Compute FK
     if joint_cfg is None:
-        lower, upper = get_joint_limits(urdf)
+        lower, upper = joint_limits
         joint_cfg = (lower + upper) / 2
-    Ts = get_link_transforms(urdf, joint_cfg)
+    Ts = compute_transforms(joint_cfg)
 
     # Sample points for each link
     link_points: dict[str, np.ndarray] = {}
     for link_name in link_names:
-        mesh = get_collision_mesh_for_link(urdf, link_name)
-        if not mesh.is_empty:
+        mesh = link_meshes.get(link_name)
+        if mesh is not None and not mesh.is_empty:
             link_points[link_name] = mesh.sample(p.n_samples)  # type: ignore[assignment]
         else:
             link_points[link_name] = np.zeros((0, 3))
@@ -677,20 +692,23 @@ def _refine_robot_spheres(
     assert all_centers is not None  # guaranteed by above check
 
     # Build collision pair mask
-    non_contiguous_pairs = get_non_contiguous_link_pairs(urdf, link_names)
-
     logger.info("Computing mesh distances for link pairs...")
     link_name_to_internal = {name: i for i, name in enumerate(link_names)}
     pairs_with_spheres = []
     for link_a, link_b in non_contiguous_pairs:
+        if link_a not in link_name_to_internal or link_b not in link_name_to_internal:
+            continue
         range_a = flat_data.link_sphere_ranges[link_name_to_internal[link_a]]
         range_b = flat_data.link_sphere_ranges[link_name_to_internal[link_b]]
         if range_a[0] < range_a[1] and range_b[0] < range_b[1]:
             pairs_with_spheres.append((link_a, link_b))
 
     mesh_distances = compute_mesh_distances_batch(
-        urdf,
+        link_meshes,
         pairs_with_spheres,
+        all_link_names,
+        joint_limits,
+        compute_transforms,
         n_samples=1000,
         bbox_skip_threshold=0.1,
         joint_cfg=joint_cfg,
@@ -727,7 +745,13 @@ def _refine_robot_spheres(
 
     # Log initial self-collision distance (excludes adjacent links and inherently close meshes)
     initial_min_dist = _compute_min_self_collision_distance(
-        urdf, link_spheres, valid_pairs=valid_pairs, joint_cfg=joint_cfg
+        link_spheres,
+        all_link_names,
+        joint_limits,
+        compute_transforms,
+        non_contiguous_pairs,
+        valid_pairs=valid_pairs,
+        joint_cfg=joint_cfg,
     )
     if initial_min_dist < 0:
         logger.info(f"Self-collision: {-initial_min_dist:.4f} penetration (initial)")
@@ -769,7 +793,13 @@ def _refine_robot_spheres(
 
     # Log final self-collision distance
     final_min_dist = _compute_min_self_collision_distance(
-        urdf, refined_link_spheres, valid_pairs=valid_pairs, joint_cfg=joint_cfg
+        refined_link_spheres,
+        all_link_names,
+        joint_limits,
+        compute_transforms,
+        non_contiguous_pairs,
+        valid_pairs=valid_pairs,
+        joint_cfg=joint_cfg,
     )
     if final_min_dist < 0:
         logger.info(f"Self-collision: {-final_min_dist:.4f} penetration (final)")
