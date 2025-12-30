@@ -117,27 +117,41 @@ class Robot:
         similarity group gets spheres allocated, and secondary links
         will reuse them.
 
+        The allocation accounts for similarity multipliers: if a primary
+        link has N secondary copies, each sphere allocated to it counts
+        (1 + N) times in the final output.
+
         Args:
-            target_spheres: Total number of spheres
+            target_spheres: Total number of spheres in final output
             min_per_link: Minimum spheres per link
 
         Returns:
             Dict mapping link names to sphere counts
         """
-        # Build set of secondary links (those that will reuse from primary)
+        # Build set of secondary links and compute multipliers for primaries
         secondary_links = set()
+        primary_multiplier: dict[str, int] = {}  # primary -> count of copies (including itself)
+
         for group in self._similarity.groups:
-            for link in group[1:]:  # All but first (primary)
+            primary = group[0]
+            primary_multiplier[primary] = len(group)  # primary + all secondaries
+            for link in group[1:]:
                 secondary_links.add(link)
 
         # Only allocate to primary links
         primary_links = [l for l in self._links if l not in secondary_links]
+
+        # For links not in any similarity group, multiplier is 1
+        for link in primary_links:
+            if link not in primary_multiplier:
+                primary_multiplier[link] = 1
 
         allocation = _allocate_spheres_for_robot(
             self.urdf,
             primary_links,
             target_spheres=target_spheres,
             min_per_link=min_per_link,
+            multipliers=primary_multiplier,
         )
 
         # Secondary links get same allocation as their primary
@@ -244,6 +258,7 @@ def _allocate_spheres_for_robot(
     links: list[str],
     target_spheres: int,
     min_per_link: int = 1,
+    multipliers: dict[str, int] | None = None,
 ) -> dict[str, int]:
     """
     Allocate sphere budget across links based on geometry complexity.
@@ -255,12 +270,17 @@ def _allocate_spheres_for_robot(
     Args:
         urdf: yourdfpy URDF object
         links: List of link names to allocate for
-        target_spheres: Total number of spheres to allocate
+        target_spheres: Total number of spheres in final output
         min_per_link: Minimum spheres per link
+        multipliers: Dict mapping link names to their replication count
+            (1 = no copies, 2 = one secondary copy, etc.)
 
     Returns:
         Dict mapping link names to sphere counts
     """
+    if multipliers is None:
+        multipliers = {link: 1 for link in links}
+
     # Compute weights based on sphere inefficiency
     weights = {}
     for link_name in links:
@@ -289,19 +309,32 @@ def _allocate_spheres_for_robot(
         per_link = max(1, target_spheres // len(links))
         return {link: per_link for link in links}
 
-    # Allocate proportionally to inefficiency
+    # Compute effective budget: each sphere on a link counts multiplier times
+    # We want: sum(allocation[link] * multiplier[link]) ≈ target_spheres
+    # So we allocate based on weight / multiplier to balance it out
+    total_weighted = sum(weights[link] / multipliers.get(link, 1) for link in links)
+
     allocation = {}
     for link_name in links:
-        frac = weights[link_name] / total_weight
-        allocation[link_name] = max(min_per_link, round(target_spheres * frac))
+        mult = multipliers.get(link_name, 1)
+        # Weight adjusted by multiplier: high-multiplier links get fewer spheres
+        adjusted_weight = weights[link_name] / mult
+        frac = adjusted_weight / total_weighted
+        allocation[link_name] = max(min_per_link, round(target_spheres * frac / mult))
 
-    # Adjust if over budget (subtract from largest allocations)
-    while sum(allocation.values()) > target_spheres:
-        max_link = max(allocation, key=lambda k: allocation[k])
-        if allocation[max_link] > min_per_link:
-            allocation[max_link] -= 1
-        else:
+    # Compute effective total (accounting for multipliers)
+    def effective_total():
+        return sum(allocation[link] * multipliers.get(link, 1) for link in links)
+
+    # Adjust if over budget (subtract from largest allocations, preferring high-multiplier links)
+    while effective_total() > target_spheres:
+        # Prefer reducing links with high multipliers (more impact per reduction)
+        candidates = [k for k in allocation if allocation[k] > min_per_link]
+        if not candidates:
             break
+        # Sort by multiplier descending, then by allocation descending
+        candidates.sort(key=lambda k: (-multipliers.get(k, 1), -allocation[k]))
+        allocation[candidates[0]] -= 1
 
     return allocation
 
