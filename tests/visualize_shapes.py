@@ -111,29 +111,34 @@ class _ShapesGui:
 
         with server.gui.add_folder("Quality Metrics"):
             self._coverage = server.gui.add_number(
-                "Coverage",
+                "Coverage ↑",
                 initial_value=0.0001,
                 disabled=True,
+                hint="Fraction of mesh surface points inside spheres (0-1). Higher is better.",
             )
             self._tightness = server.gui.add_number(
-                "Tightness",
+                "Tightness ↑",
                 initial_value=0.0001,
                 disabled=True,
+                hint="hull_volume / sphere_volume (0-1). Higher means tighter fit. A single bounding sphere ~0.05.",
             )
             self._quality = server.gui.add_number(
-                "Quality",
+                "Quality ↑",
                 initial_value=0.0001,
                 disabled=True,
+                hint="coverage × tightness. Combined score rewarding both high coverage and tight fit.",
             )
             self._volume_overhead = server.gui.add_number(
-                "Volume Overhead",
+                "Volume Overhead ↓",
                 initial_value=0.0001,
                 disabled=True,
+                hint="sphere_volume / hull_volume. Lower is better (1.0 = perfect, >1 = over-approximation).",
             )
             self._over_extension = server.gui.add_number(
-                "Over Extension",
+                "Over Extension ↓",
                 initial_value=0.0001,
                 disabled=True,
+                hint="Volume inside spheres but outside mesh, as ratio of mesh volume. Lower is better (0 = perfect).",
             )
 
     def _get_shape_names_for_category(self, category: str) -> list[str]:
