@@ -74,3 +74,7 @@ dmypy.json
 
 # Git worktrees
 _worktrees/
+CLAUDE.md
+
+# Generated outputs
+*.json

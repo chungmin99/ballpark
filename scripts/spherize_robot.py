@@ -1,189 +1,66 @@
-#!/usr/bin/env python3
-"""Headless sphere decomposition for robot URDFs.
-
-Computes sphere decomposition for a robot URDF and exports to JSON.
-"""
+"""Decompose a robot URDF into spheres e.g., for collision checking."""
 
 from __future__ import annotations
 
-import sys
-import time
-from dataclasses import dataclass
-from pathlib import Path
 from typing import Literal
+from pathlib import Path
 
-import yourdfpy
 import tyro
+import yourdfpy
+from loguru import logger
+from robot_descriptions.loaders.yourdfpy import load_robot_description
 
-import ballpark
+from ballpark import Robot
 
 
-@dataclass
-class Args:
+def main(
+    robot_name: Literal["ur5", "panda", "yumi", "g1"] = "panda",
+    target_spheres: int = 40,
+    output_path: Path = Path("spheres.json"),
+    refine: bool = False,
+) -> None:
     """Compute sphere decomposition for a robot URDF.
 
+    Args:
+        robot_name: Robot name from robot_descriptions (e.g., panda).
+        target_spheres: Target sphere count across robot.
+        output_path: Output JSON file path.
+        refine: If True, optimize sphere positions and radii using gradient descent.
+
     Examples:
-        python scripts/spherize_robot.py --robot-name panda --preset conservative
-        python scripts/spherize_robot.py --urdf my_robot.urdf --total-spheres 150
+        python scripts/spherize_robot.py --robot-name panda
+        python scripts/spherize_robot.py --robot-name panda --refine
     """
+    # Load URDF.
+    # You could alternatively load from a file directly:
+    # urdf_obj = yourdfpy.URDF.load(urdf, load_collision_meshes=True)
+    logger.info("Loading URDF...")
 
-    # Input (one required)
-    urdf: str | None = None
-    """Path to URDF file."""
-
-    robot_name: str | None = None
-    """Robot name from robot_descriptions (e.g., panda, ur5, iiwa14)."""
-
-    # Output
-    output: str = "spheres.json"
-    """Output JSON file path."""
-
-    # Config
-    preset: Literal["conservative", "balanced", "surface"] = "balanced"
-    """Configuration preset."""
-
-    target_spheres: int = 100
-    """Target sphere count across robot (may slightly exceed)."""
-
-    padding: float | None = None
-    """Override padding value (default: from preset)."""
-
-    # Refinement
-    refine: bool = True
-    """Enable per-link NLLS refinement."""
-
-    self_collision: bool = False
-    """Enable robot-level self-collision refinement."""
-
-    # Output control
-    quiet: bool = False
-    """Suppress progress output."""
-
-
-def load_urdf(urdf_path: str | None, robot_name: str | None) -> yourdfpy.URDF:
-    """Load URDF from path or robot_descriptions."""
-    if robot_name:
-        try:
-            from robot_descriptions.loaders.yourdfpy import load_robot_description
-
-            urdf = load_robot_description(f"{robot_name}_description")
-            # Reload with collision meshes
-            return yourdfpy.URDF(
-                robot=urdf.robot,
-                filename_handler=urdf._filename_handler,
-                load_collision_meshes=True,
-            )
-        except ImportError:
-            print(
-                "Error: robot_descriptions is required for --robot-name. "
-                "Install with: pip install robot_descriptions",
-                file=sys.stderr,
-            )
-            sys.exit(1)
-        except Exception as e:
-            print(f"Error loading robot '{robot_name}': {e}", file=sys.stderr)
-            sys.exit(1)
-    elif urdf_path:
-        try:
-            return yourdfpy.URDF.load(urdf_path, load_collision_meshes=True)
-        except Exception as e:
-            print(f"Error loading URDF '{urdf_path}': {e}", file=sys.stderr)
-            sys.exit(1)
-    else:
-        print("Error: Must specify either --urdf or --robot-name", file=sys.stderr)
-        sys.exit(1)
-
-
-def main(args: Args) -> None:
-    """Run sphere decomposition."""
-
-    def log(msg: str) -> None:
-        if not args.quiet:
-            print(msg)
-
-    # Validate input
-    if args.urdf is None and args.robot_name is None:
-        print("Error: Must specify either --urdf or --robot-name", file=sys.stderr)
-        sys.exit(1)
-    if args.urdf is not None and args.robot_name is not None:
-        print("Error: Cannot specify both --urdf and --robot-name", file=sys.stderr)
-        sys.exit(1)
-
-    # Load URDF
-    log("Loading URDF...")
-    urdf = load_urdf(args.urdf, args.robot_name)
-
-    # Build kwargs for compute_spheres_for_robot
-    kwargs: dict = {
-        "preset": args.preset,
-        "refine": args.refine,
-    }
-
-    # Add padding override if specified
-    if args.padding is not None:
-        kwargs["padding"] = args.padding
-
-    # Add self-collision options if enabled
-    if args.self_collision:
-        kwargs["refine_self_collision"] = True
-        # Get initial joint config (middle of limits)
-        lower, upper = ballpark.get_joint_limits(urdf)
-        initial_cfg = (lower + upper) / 2
-        kwargs["joint_cfg"] = initial_cfg
-
-        # Pre-compute mesh distances
-        log("Pre-computing mesh distances...")
-        t0 = time.perf_counter()
-        links_with_collision = [
-            link_name
-            for link_name in urdf.link_map.keys()
-            if not ballpark.get_collision_mesh_for_link(urdf, link_name).is_empty
-        ]
-        non_contiguous_pairs = ballpark.get_non_contiguous_link_pairs(
-            urdf, links_with_collision
-        )
-        mesh_distances = ballpark.compute_mesh_distances_batch(
-            urdf,
-            non_contiguous_pairs,
-            n_samples=1000,
-            joint_cfg=initial_cfg,
-        )
-        kwargs["mesh_distances"] = mesh_distances
-        elapsed_ms = (time.perf_counter() - t0) * 1000
-        log(f"Cached {len(mesh_distances)} mesh distances in {elapsed_ms:.1f}ms")
-
-    # Compute spheres
-    log(
-        f"Computing spheres (preset={args.preset}, target={args.target_spheres}, "
-        f"refine={args.refine}, self_collision={args.self_collision})..."
+    urdf_obj = load_robot_description(f"{robot_name}_description")
+    urdf_obj = yourdfpy.URDF(
+        robot=urdf_obj.robot,
+        filename_handler=urdf_obj._filename_handler,
+        load_collision_meshes=True,
     )
-    t0 = time.perf_counter()
-    result = ballpark.compute_spheres_for_robot(
-        urdf,
-        target_spheres=args.target_spheres,
-        **kwargs,
-    )
-    elapsed_ms = (time.perf_counter() - t0) * 1000
 
-    total_spheres_count = sum(len(s) for s in result.link_spheres.values())
-    log(f"Generated {total_spheres_count} spheres in {elapsed_ms:.1f}ms")
+    # Create Robot and compute spheres
+    logger.info("Analyzing robot structure...")
+    robot = Robot(urdf_obj)
+
+    logger.info(f"Computing spheres (target={target_spheres})...")
+    result = robot.spherize(target_spheres=target_spheres)
+
+    # Optionally refine spheres
+    if refine:
+        logger.info("Refining spheres...")
+        result = robot.refine(result)
 
     # Export to JSON
-    ballpark.export_spheres_to_json(
-        link_spheres=result.link_spheres,
-        output_path=args.output,
-        ignore_pairs=result.ignore_pairs,
+    result.save_json(output_path)
+    logger.info(
+        f"Exported spheres to {output_path} (total spheres={result.num_spheres})"
     )
-    log(f"Exported to {args.output}")
-
-    if not args.quiet:
-        # Print summary
-        print("\nPer-link sphere counts:")
-        for link_name, spheres in sorted(result.link_spheres.items()):
-            if spheres:
-                print(f"  {link_name}: {len(spheres)}")
 
 
 if __name__ == "__main__":
-    args = tyro.cli(Args)
-    main(args)
+    tyro.cli(main)

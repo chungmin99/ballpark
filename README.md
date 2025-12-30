@@ -21,8 +21,8 @@ We also include an interactive visualization and parameter adjusting GUI using [
 ## Installation
 
 ```bash
-pip install -e .  # base installation
-pip install -e ".[robot]"  # with robot URDF support, visualization, and CLI tools
+pip install -e .
+pip install -e ".[examples]"
 pip install -e ".[dev]"  # with development tools (linting, testing)
 ```
 
@@ -32,17 +32,13 @@ pip install -e ".[dev]"  # with development tools (linting, testing)
 
 ```python
 import trimesh
-from ballpark import spherize_adaptive_tight
+from ballpark import spherize
 
 # Load mesh
 mesh = trimesh.load("object.stl")
 
-# Generate spheres with adaptive fitting and NLLS refinement
-spheres = spherize_adaptive_tight(
-    mesh,
-    target_spheres=32,
-    refine=True,  # Enable JAX-based optimization
-)
+# Generate spheres with adaptive fitting
+spheres = spherize(mesh, target_spheres=32)
 
 for s in spheres:
     print(f"center={s.center}, radius={s.radius}")
@@ -53,7 +49,7 @@ for s in spheres:
 ```python
 import yourdfpy
 from robot_descriptions.loaders.yourdfpy import load_robot_description
-from ballpark import compute_spheres_for_robot
+from ballpark import Robot, BallparkConfig, SpherePreset
 
 # Load robot URDF with collision meshes
 urdf = load_robot_description("panda_description")
@@ -62,12 +58,13 @@ urdf_coll = yourdfpy.URDF(
     load_collision_meshes=True,
 )
 
-# Compute spheres across all links
-result = compute_spheres_for_robot(
-    urdf_coll,
-    target_spheres=100,
-    preset="balanced",  # or "conservative", "surface"
-)
+# Create robot and generate spheres
+robot = Robot(urdf_coll)
+result = robot.spherize(target_spheres=100)
+
+# Optional: refine with link- and robot-level costs
+config = BallparkConfig.from_preset(SpherePreset.BALANCED)
+result = robot.refine(result, config=config)
 
 for link_name, spheres in result.link_spheres.items():
     print(f"{link_name}: {len(spheres)} spheres")

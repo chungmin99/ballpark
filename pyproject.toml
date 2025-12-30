@@ -23,15 +23,16 @@ dependencies = [
     "scikit-learn",
     "scipy",
     "jax>=0.4.0",
+    "jax_dataclasses",
     "jaxlib",
     "jaxlie",
     "optax",
     "loguru",
+    "yourdfpy",
 ]
 
 [project.optional-dependencies]
-robot = [
-    "yourdfpy",
+examples = [
     "robot_descriptions",
     "tyro",
     "viser",
