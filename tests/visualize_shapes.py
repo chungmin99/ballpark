@@ -27,6 +27,7 @@ sys.path.insert(0, str(Path(__file__).parent))
 from ballpark import spherize, Sphere, SPHERE_COLORS
 from ballpark.metrics import (
     compute_coverage,
+    compute_over_extension,
     compute_quality,
     compute_tightness,
     compute_volume_overhead,
@@ -129,6 +130,11 @@ class _ShapesGui:
                 initial_value=0.0001,
                 disabled=True,
             )
+            self._over_extension = server.gui.add_number(
+                "Over Extension",
+                initial_value=0.0001,
+                disabled=True,
+            )
 
     def _get_shape_names_for_category(self, category: str) -> list[str]:
         """Get shape names for a category."""
@@ -203,6 +209,7 @@ class _ShapesGui:
         tightness: float,
         quality: float,
         overhead: float,
+        over_extension: float,
         count: int,
     ) -> None:
         """Update the metrics display."""
@@ -210,6 +217,7 @@ class _ShapesGui:
         self._tightness.value = round(tightness, 4)
         self._quality.value = round(quality, 4)
         self._volume_overhead.value = round(overhead, 2)
+        self._over_extension.value = round(over_extension, 2)
         self._sphere_count.value = count
 
 
@@ -320,9 +328,15 @@ def main() -> None:
                 tightness = compute_tightness(points, current_spheres)
                 overhead = compute_volume_overhead(points, current_spheres)
                 quality = compute_quality(coverage, tightness)
+                over_ext = compute_over_extension(current_mesh, current_spheres)
 
                 gui.update_metrics(
-                    coverage, tightness, quality, overhead, len(current_spheres)
+                    coverage,
+                    tightness,
+                    quality,
+                    overhead,
+                    over_ext["over_extension_ratio"],
+                    len(current_spheres),
                 )
 
                 # Update visuals

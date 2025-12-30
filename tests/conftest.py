@@ -208,6 +208,10 @@ MAX_VOLUME_OVERHEAD = 10.0
 # Minimum quality score (coverage * tightness)
 MIN_QUALITY = 0.10
 
+# Maximum over-extension ratio (over_extension_volume / mesh_volume)
+# Spheres should not extend more than 3x the mesh volume beyond the mesh
+MAX_OVER_EXTENSION_RATIO = 3.0
+
 
 # =============================================================================
 # QUALITY METRIC FUNCTIONS (imported from ballpark.metrics)
@@ -215,6 +219,7 @@ MIN_QUALITY = 0.10
 
 from ballpark.metrics import (
     compute_coverage,
+    compute_over_extension,
     compute_quality,
     compute_tightness,
     compute_volume_overhead,
@@ -293,4 +298,17 @@ def assert_volume_overhead_below_maximum(
         raise AssertionError(
             f"Volume overhead {overhead:.2f}x exceeds maximum {max_overhead}x. "
             f"Spheres occupy too much volume relative to mesh. {msg}"
+        )
+
+
+def assert_over_extension_below_maximum(
+    over_extension_ratio: float,
+    max_ratio: float = MAX_OVER_EXTENSION_RATIO,
+    msg: str = "",
+) -> None:
+    """Assert that over-extension ratio is below maximum threshold."""
+    if over_extension_ratio > max_ratio:
+        raise AssertionError(
+            f"Over-extension ratio {over_extension_ratio:.2f}x exceeds maximum {max_ratio}x. "
+            f"Spheres extend too far beyond the mesh surface. {msg}"
         )
