@@ -94,7 +94,7 @@ def spherize(
             return False
 
         aspect = get_aspect_ratio(pts)
-        tightness = compute_tightness(pts, sphere)
+        tightness = _compute_sphere_bloat(pts, sphere)
 
         # Force split if sphere exceeds max radius
         if sphere.radius > max_radius:
@@ -252,8 +252,12 @@ def get_aspect_ratio(points: np.ndarray) -> float:
     return min(ratio, 100.0)
 
 
-def compute_tightness(points: np.ndarray, sphere: Sphere) -> float:
-    """Compute sphere volume / convex hull volume ratio."""
+def _compute_sphere_bloat(points: np.ndarray, sphere: Sphere) -> float:
+    """Compute sphere volume / convex hull volume ratio (internal).
+
+    Higher values indicate the sphere is loose compared to the point cloud.
+    Used internally to decide when to split regions.
+    """
     if len(points) < 4:
         return 1.0
     try:

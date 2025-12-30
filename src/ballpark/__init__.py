@@ -8,6 +8,7 @@ from ._robot import Robot as Robot
 from ._robot import RobotSpheresResult as RobotSpheresResult
 from ._spherize import Sphere as Sphere
 from ._spherize import spherize as spherize
+from . import metrics as metrics
 
 __version__ = "0.0.0"
 

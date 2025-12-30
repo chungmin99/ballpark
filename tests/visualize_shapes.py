@@ -24,10 +24,13 @@ import viser
 sys.path.insert(0, str(Path(__file__).parent.parent / "src"))
 sys.path.insert(0, str(Path(__file__).parent))
 
-from scipy.spatial import ConvexHull, QhullError
-
 from ballpark import spherize, Sphere, SPHERE_COLORS
-from ballpark._spherize import compute_coverage
+from ballpark.metrics import (
+    compute_coverage,
+    compute_quality,
+    compute_tightness,
+    compute_volume_overhead,
+)
 
 from shapes import (
     get_primitive_shapes,
@@ -38,58 +41,6 @@ from shapes import (
     get_shape_by_name,
     ShapeSpec,
 )
-
-
-# =============================================================================
-# Quality metrics (copied from conftest.py for standalone use)
-# =============================================================================
-
-
-def compute_tightness(points: np.ndarray, spheres: list[Sphere]) -> float:
-    """Compute tightness: hull_volume / total_sphere_volume.
-
-    Higher is better (max 1.0 for perfect fit).
-    """
-    if len(points) < 4 or len(spheres) == 0:
-        return 0.0
-
-    try:
-        hull_vol = ConvexHull(points).volume
-    except (QhullError, ValueError):
-        return 0.0
-
-    total_sphere_vol = sum(4 / 3 * np.pi * float(s.radius) ** 3 for s in spheres)
-
-    if total_sphere_vol < 1e-10:
-        return 0.0
-
-    return float(hull_vol / total_sphere_vol)
-
-
-def compute_volume_overhead(points: np.ndarray, spheres: list[Sphere]) -> float:
-    """Compute volume overhead: total_sphere_volume / hull_volume.
-
-    Lower is better (1.0 = perfect, >1.0 = over-approximation).
-    """
-    if len(points) < 4 or len(spheres) == 0:
-        return float("inf")
-
-    try:
-        hull_vol = ConvexHull(points).volume
-    except (QhullError, ValueError):
-        return float("inf")
-
-    if hull_vol < 1e-10:
-        return float("inf")
-
-    total_sphere_vol = sum(4 / 3 * np.pi * float(s.radius) ** 3 for s in spheres)
-
-    return float(total_sphere_vol / hull_vol)
-
-
-def compute_quality(coverage: float, tightness: float) -> float:
-    """Compute combined quality score: coverage * tightness."""
-    return coverage * tightness
 
 
 class _ShapesGui:
