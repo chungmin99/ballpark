@@ -23,7 +23,7 @@ import yourdfpy
 from robot_descriptions.loaders.yourdfpy import load_robot_description
 from viser.extras import ViserUrdf
 
-from ballpark import Robot, RobotSpheresResult, Sphere
+from ballpark import Robot, RobotSpheresResult, Sphere, SPHERE_COLORS
 
 
 def main(
@@ -327,19 +327,6 @@ class _SpheresGui:
 class _SphereVisuals:
     """Manages sphere visualization in viser."""
 
-    COLORS = [
-        (255, 100, 100),
-        (100, 255, 100),
-        (100, 100, 255),
-        (255, 255, 100),
-        (255, 100, 255),
-        (100, 255, 255),
-        (255, 180, 100),
-        (180, 100, 255),
-        (100, 180, 100),
-        (255, 200, 150),
-    ]
-
     def __init__(self, server: viser.ViserServer, link_names: list[str]):
         self._server = server
         self._link_names = link_names
@@ -371,7 +358,7 @@ class _SphereVisuals:
             if not spheres:
                 continue
 
-            color = self.COLORS[link_idx % len(self.COLORS)]
+            color = SPHERE_COLORS[link_idx % len(SPHERE_COLORS)]
             rgb = (color[0] / 255.0, color[1] / 255.0, color[2] / 255.0)
 
             for sphere_idx, sphere in enumerate(spheres):

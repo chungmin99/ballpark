@@ -10,3 +10,17 @@ from ._spherize import Sphere as Sphere
 from ._spherize import spherize as spherize
 
 __version__ = "0.0.0"
+
+# Colors for sphere visualization (RGB tuples, 0-255)
+SPHERE_COLORS: tuple[tuple[int, int, int], ...] = (
+    (255, 100, 100),
+    (100, 255, 100),
+    (100, 100, 255),
+    (255, 255, 100),
+    (255, 100, 255),
+    (100, 255, 255),
+    (255, 180, 100),
+    (180, 100, 255),
+    (100, 180, 100),
+    (255, 200, 150),
+)
