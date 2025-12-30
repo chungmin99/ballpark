@@ -2,9 +2,10 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass
 from typing import cast, TYPE_CHECKING
 
+import jax.numpy as jnp
+import jax_dataclasses as jdc
 import numpy as np
 import trimesh
 from sklearn.decomposition import PCA
@@ -14,12 +15,16 @@ if TYPE_CHECKING:
     from ._config import SpherizeParams
 
 
-@dataclass
+@jdc.pytree_dataclass
 class Sphere:
-    """A sphere defined by center and radius."""
+    """A sphere defined by center and radius.
 
-    center: np.ndarray
-    radius: float
+    Can represent a single sphere (center: (3,), radius: scalar) or
+    a batch of spheres (center: (N, 3), radius: (N,)).
+    """
+
+    center: jnp.ndarray
+    radius: jnp.ndarray
 
 
 def spherize(
@@ -86,7 +91,7 @@ def spherize(
         if len(pts) < 15 or budget <= 0:
             if len(pts) > 0 and budget > 0:
                 s = fit_sphere_minmax(pts, padding, percentile)
-                s.radius = min(s.radius, max_radius)  # cap radius
+                s = jdc.replace(s, radius=min(s.radius, max_radius))  # cap radius
                 return [s]
             return []
 
@@ -125,8 +130,10 @@ def spherize(
     if uniform_radius and len(spheres) > 1:
         radii = np.array([s.radius for s in spheres])
         median_radius = np.median(radii)
-        for s in spheres:
-            s.radius = np.clip(s.radius, median_radius * 0.4, median_radius * 2.5)
+        spheres = [
+            jdc.replace(s, radius=np.clip(s.radius, median_radius * 0.4, median_radius * 2.5))
+            for s in spheres
+        ]
 
     return spheres
 
@@ -152,7 +159,7 @@ def fit_sphere_minmax(
             r = max(r, 1e-4)  # Ensure minimum radius for degenerate cases
         else:
             r = 0.01
-        return Sphere(c, r * padding)
+        return Sphere(center=jnp.asarray(c), radius=jnp.asarray(r * padding))
 
     center = points.mean(axis=0)
 
@@ -169,7 +176,7 @@ def fit_sphere_minmax(
     p_med = np.median(dists)
     radius = (0.85 * p_high + 0.15 * p_med) * padding
 
-    return Sphere(center, radius)
+    return Sphere(center=jnp.asarray(center), radius=jnp.asarray(radius))
 
 
 def get_aspect_ratio(points: np.ndarray) -> float:
@@ -192,7 +199,7 @@ def compute_tightness(points: np.ndarray, sphere: Sphere) -> float:
         return 1.0
     try:
         hull_vol = ConvexHull(points).volume
-        sphere_vol = 4 / 3 * np.pi * sphere.radius**3
-        return sphere_vol / (hull_vol + 1e-10)
+        sphere_vol = 4 / 3 * np.pi * float(sphere.radius) ** 3
+        return float(sphere_vol / (hull_vol + 1e-10))
     except (QhullError, ValueError):
         return 1.0

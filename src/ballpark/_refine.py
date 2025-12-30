@@ -2,13 +2,11 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass
-from functools import partial
-
 import numpy as np
 import jax
 import jax.numpy as jnp
 from jax import lax
+import jax_dataclasses as jdc
 import jaxlie
 import optax
 from loguru import logger
@@ -32,7 +30,7 @@ from .utils._mesh_utils import compute_mesh_distances_batch
 # =============================================================================
 
 
-@dataclass
+@jdc.pytree_dataclass
 class _FlattenedSphereData:
     """Flattened sphere and point data for JIT-compatible optimization.
 
@@ -41,11 +39,11 @@ class _FlattenedSphereData:
     per-link data into contiguous arrays with index mappings.
     """
 
-    # Flattened arrays for optimization
-    centers: jnp.ndarray  # (N, 3) all sphere centers concatenated
-    radii: jnp.ndarray  # (N,) all sphere radii concatenated
-    initial_centers: jnp.ndarray  # (N, 3) copy for regularization
-    initial_radii: jnp.ndarray  # (N,) copy for regularization
+    # Batched spheres
+    spheres: Sphere  # center: (N, 3), radius: (N,)
+    initial_spheres: Sphere  # copy for regularization
+
+    # Point data
     points_all: jnp.ndarray  # (P, 3) all surface points concatenated
 
     # Index mappings for per-link operations
@@ -54,16 +52,26 @@ class _FlattenedSphereData:
     sphere_link_mask: jnp.ndarray  # (N, N) bool - True if spheres on same link
     sphere_transforms: jnp.ndarray  # (N, 7) FK transform (wxyz+xyz) per sphere
 
-    # For unflattening back to per-link dicts
-    link_sphere_ranges: list[tuple[int, int]]  # (start, end) for each link
-    link_point_ranges: list[tuple[int, int]]  # (start, end) for each link
-    link_names: list[str]  # ordered list of link names
-    all_centers_list: list  # original centers list for similarity matching
+    # Metadata (static - not traced by JAX)
+    link_sphere_ranges: jdc.Static[tuple[tuple[int, int], ...]]
+    link_point_ranges: jdc.Static[tuple[tuple[int, int], ...]]
+    link_names: jdc.Static[tuple[str, ...]]
+    n_spheres: jdc.Static[int]
+    n_links: jdc.Static[int]
+    scale: jdc.Static[float]
 
-    # Metadata
-    n_spheres: int
-    n_links: int
-    scale: float  # bbox diagonal for normalization
+
+@jdc.pytree_dataclass
+class RobotRefineContext:
+    """Robot-level optimization context.
+
+    Contains data specific to robot refinement that is computed after
+    flattening spheres (collision pairs, similarity matching).
+    """
+
+    collision_pair_mask: jnp.ndarray  # (N, N) bool - pairs to check for collision
+    similarity_pairs: jnp.ndarray  # (M, 2) int32 - matched sphere indices
+    params: RefineParams
 
 
 # =============================================================================
@@ -123,7 +131,7 @@ def _compute_min_self_collision_distance(
                 center_j_world = np.array(so3_b @ sphere_j.center) + xyz_b
 
                 dist = np.linalg.norm(center_i_world - center_j_world)
-                signed_dist = dist - (sphere_i.radius + sphere_j.radius)
+                signed_dist = float(dist - (sphere_i.radius + sphere_j.radius))
 
                 min_dist = min(min_dist, signed_dist)
 
@@ -141,8 +149,13 @@ def _build_flattened_sphere_data(
     link_names: list[str],
     Ts: np.ndarray,
     link_name_to_idx: dict[str, int],
-) -> _FlattenedSphereData | None:
-    """Flatten per-link sphere/point dicts into arrays for JAX optimization."""
+) -> tuple[_FlattenedSphereData, list] | tuple[None, None]:
+    """Flatten per-link sphere/point dicts into arrays for JAX optimization.
+
+    Returns:
+        Tuple of (flattened_data, all_centers_list) or (None, None) if no spheres.
+        all_centers_list is returned separately for similarity pair computation.
+    """
     all_centers = []
     all_radii = []
     all_points = []
@@ -158,8 +171,8 @@ def _build_flattened_sphere_data(
 
         start_sphere = sphere_idx
         for s in spheres:
-            all_centers.append(s.center)
-            all_radii.append(s.radius)
+            all_centers.append(np.asarray(s.center))
+            all_radii.append(np.asarray(s.radius))
             sphere_idx += 1
         link_sphere_ranges.append((start_sphere, sphere_idx))
 
@@ -170,7 +183,7 @@ def _build_flattened_sphere_data(
         link_point_ranges.append((start_point, point_idx))
 
     if not all_centers:
-        return None
+        return None, None
 
     n_spheres = len(all_centers)
     n_links = len(link_names)
@@ -178,6 +191,10 @@ def _build_flattened_sphere_data(
     centers = jnp.array(all_centers)
     radii = jnp.array(all_radii)
     points_all = jnp.array(np.vstack(all_points) if all_points else np.zeros((1, 3)))
+
+    # Create batched Sphere objects
+    spheres = Sphere(center=centers, radius=radii)
+    initial_spheres = Sphere(center=centers, radius=radii)
 
     sphere_to_link_list = []
     for i, link_name in enumerate(link_names):
@@ -215,24 +232,22 @@ def _build_flattened_sphere_data(
         )
     scale = float(bbox_diag + 1e-8)
 
-    return _FlattenedSphereData(
-        centers=centers,
-        radii=radii,
-        initial_centers=centers,
-        initial_radii=radii,
+    flat_data = _FlattenedSphereData(
+        spheres=spheres,
+        initial_spheres=initial_spheres,
         points_all=points_all,
         sphere_to_link=sphere_to_link,
         point_to_link=point_to_link,
         sphere_link_mask=sphere_link_mask,
         sphere_transforms=sphere_transforms,
-        link_sphere_ranges=link_sphere_ranges,
-        link_point_ranges=link_point_ranges,
-        link_names=link_names,
-        all_centers_list=all_centers,
+        link_sphere_ranges=tuple(link_sphere_ranges),
+        link_point_ranges=tuple(link_point_ranges),
+        link_names=tuple(link_names),
         n_spheres=n_spheres,
         n_links=n_links,
         scale=scale,
     )
+    return flat_data, all_centers
 
 
 def _build_collision_pair_mask(
@@ -309,7 +324,7 @@ def _build_similarity_pairs(
         if n_first == 0:
             continue
 
-        first_centers_np = np.array(all_centers[first_range[0]:first_range[1]])
+        first_centers_np = np.array(all_centers[first_range[0] : first_range[1]])
 
         for other_link in group_links[1:]:
             other_internal_idx = link_name_to_internal_idx[other_link]
@@ -319,7 +334,7 @@ def _build_similarity_pairs(
             if n_other == 0:
                 continue
 
-            other_centers_np = np.array(all_centers[other_range[0]:other_range[1]])
+            other_centers_np = np.array(all_centers[other_range[0] : other_range[1]])
 
             transform = similarity_result.transforms.get(
                 (first_link, other_link), np.eye(4)
@@ -372,7 +387,7 @@ def _unflatten_to_link_spheres(
     for i, link_name in enumerate(link_names):
         start, end = link_sphere_ranges[i]
         refined_link_spheres[link_name] = [
-            Sphere(center=centers[j], radius=float(radii[j])) for j in range(start, end)
+            Sphere(center=centers[j], radius=radii[j]) for j in range(start, end)
         ]
 
     for link_name, spheres in original_link_spheres.items():
@@ -388,25 +403,35 @@ def _unflatten_to_link_spheres(
 
 
 def _compute_robot_loss(
-    centers: jnp.ndarray,
-    radii: jnp.ndarray,
-    initial_centers: jnp.ndarray,
-    initial_radii: jnp.ndarray,
-    points_all: jnp.ndarray,
-    scale: float,
-    n_links: int,
-    sphere_to_link: jnp.ndarray,
-    point_to_link: jnp.ndarray,
-    sphere_link_mask: jnp.ndarray,
-    collision_pair_mask: jnp.ndarray,
-    sphere_transforms: jnp.ndarray,
-    similarity_pairs: jnp.ndarray,
-    params: RefineParams,
+    spheres: Sphere,
+    data: _FlattenedSphereData,
+    ctx: RobotRefineContext,
 ) -> jnp.ndarray:
-    """Compute total loss for robot-level sphere refinement (JIT-compatible)."""
+    """Compute total loss for robot-level sphere refinement (JIT-compatible).
+
+    Args:
+        spheres: Current sphere state being optimized (center: (N,3), radius: (N,))
+        data: Flattened sphere/point data with index mappings
+        ctx: Robot refinement context with collision masks and params
+    """
+    # Unpack for readability
+    centers = spheres.center
+    radii = jnp.maximum(spheres.radius, ctx.params.min_radius)
+    initial_centers = data.initial_spheres.center
+    initial_radii = data.initial_spheres.radius
+    points_all = data.points_all
+    scale = data.scale
+    n_links = data.n_links
+    sphere_to_link = data.sphere_to_link
+    point_to_link = data.point_to_link
+    sphere_link_mask = data.sphere_link_mask
+    sphere_transforms = data.sphere_transforms
+    collision_pair_mask = ctx.collision_pair_mask
+    similarity_pairs = ctx.similarity_pairs
+    params = ctx.params
+
     n_spheres = centers.shape[0]
     n_points = points_all.shape[0]
-    radii = jnp.maximum(radii, params.min_radius)
 
     total_loss = jnp.array(0.0)
 
@@ -480,12 +505,12 @@ def _compute_robot_loss(
         valid_links = link_counts > 1
         uniform_loss = jnp.sum(jnp.where(valid_links, link_uniform, 0.0))
         n_valid_links = jnp.sum(valid_links)
-        total_loss = total_loss + params.lambda_uniform * uniform_loss / (n_valid_links + 1e-8)
+        total_loss = total_loss + params.lambda_uniform * uniform_loss / (
+            n_valid_links + 1e-8
+        )
 
     # 5. Self-collision loss between non-contiguous links
-    world_diff = (
-        world_centers_current[:, None, :] - world_centers_current[None, :, :]
-    )
+    world_diff = world_centers_current[:, None, :] - world_centers_current[None, :, :]
     world_dists = jnp.sqrt(jnp.sum(world_diff**2, axis=-1) + 1e-8)
     sum_radii_mat = radii[:, None] + radii[None, :]
     signed_dist = world_dists - sum_radii_mat
@@ -527,100 +552,66 @@ def _compute_robot_loss(
 # =============================================================================
 
 
-@partial(jax.jit, static_argnames=["n_iters", "n_links"])
+@jdc.jit
 def _run_robot_optimization(
-    centers: jnp.ndarray,
-    radii: jnp.ndarray,
-    initial_centers: jnp.ndarray,
-    initial_radii: jnp.ndarray,
-    points_all: jnp.ndarray,
-    scale: float,
-    n_links: int,
-    refine_params: RefineParams,
+    data: _FlattenedSphereData,
+    ctx: RobotRefineContext,
     lr: float,
-    n_iters: int,
+    n_iters: jdc.Static[int],
     tol: float,
-    sphere_to_link: jnp.ndarray,
-    point_to_link: jnp.ndarray,
-    sphere_link_mask: jnp.ndarray,
-    collision_pair_mask: jnp.ndarray,
-    sphere_transforms: jnp.ndarray,
-    similarity_pairs: jnp.ndarray,
-) -> tuple[jnp.ndarray, jnp.ndarray, jnp.ndarray, jnp.ndarray, jnp.ndarray]:
+) -> tuple[Sphere, jnp.ndarray, jnp.ndarray, jnp.ndarray]:
     """Run the full optimization loop (JIT-compiled with early stopping).
 
-    Returns:
-        Tuple of (final_centers, final_radii, init_loss, final_loss, n_steps)
-    """
-    optimizer = optax.chain(optax.clip_by_global_norm(1.0), optax.adam(lr))
-    opt_state = optimizer.init((centers, radii))
+    Args:
+        data: Flattened sphere/point data with initial spheres
+        ctx: Robot refinement context with collision masks and params
+        lr: Learning rate for Adam optimizer
+        n_iters: Maximum number of optimization iterations
+        tol: Relative convergence tolerance for early stopping
 
-    init_loss = _compute_robot_loss(
-        centers,
-        radii,
-        initial_centers,
-        initial_radii,
-        points_all,
-        scale,
-        n_links,
-        sphere_to_link,
-        point_to_link,
-        sphere_link_mask,
-        collision_pair_mask,
-        sphere_transforms,
-        similarity_pairs,
-        refine_params,
-    )
+    Returns:
+        Tuple of (final_spheres, init_loss, final_loss, n_steps)
+    """
+    spheres = data.spheres
+    optimizer = optax.chain(optax.clip_by_global_norm(1.0), optax.adam(lr))
+    opt_state = optimizer.init(spheres)  # type: ignore[arg-type]
+
+    init_loss = _compute_robot_loss(spheres, data, ctx)
 
     def body_fn(state):
         """Single optimization step."""
-        centers, radii, opt_state, prev_loss, curr_loss, i = state
+        spheres, opt_state, prev_loss, curr_loss, i = state
 
-        def loss_fn(opt_params):
-            c, r = opt_params
-            return _compute_robot_loss(
-                c,
-                r,
-                initial_centers,
-                initial_radii,
-                points_all,
-                scale,
-                n_links,
-                sphere_to_link,
-                point_to_link,
-                sphere_link_mask,
-                collision_pair_mask,
-                sphere_transforms,
-                similarity_pairs,
-                refine_params,
-            )
+        def loss_fn(s: Sphere) -> jnp.ndarray:
+            return _compute_robot_loss(s, data, ctx)
 
-        opt_params = (centers, radii)
-        _, grads = jax.value_and_grad(loss_fn)(opt_params)
-        updates, new_opt_state = optimizer.update(grads, opt_state, opt_params)
-        new_opt_params = optax.apply_updates(opt_params, updates)
+        _, grads = jax.value_and_grad(loss_fn)(spheres)
+        updates, new_opt_state = optimizer.update(grads, opt_state, spheres)  # type: ignore[arg-type]
+        new_spheres: Sphere = optax.apply_updates(spheres, updates)  # type: ignore[assignment]
 
-        new_centers, new_radii = new_opt_params
-        new_radii = jnp.maximum(new_radii, refine_params.min_radius)
+        # Clamp radii to minimum
+        new_spheres = jdc.replace(
+            new_spheres, radius=jnp.maximum(new_spheres.radius, ctx.params.min_radius)
+        )
 
-        new_loss = loss_fn((new_centers, new_radii))
+        new_loss = loss_fn(new_spheres)
 
-        return (new_centers, new_radii, new_opt_state, curr_loss, new_loss, i + 1)
+        return (new_spheres, new_opt_state, curr_loss, new_loss, i + 1)
 
     def cond_fn(state):
         """Continue while not converged and under max iterations."""
-        centers, radii, opt_state, prev_loss, curr_loss, i = state
+        spheres, opt_state, prev_loss, curr_loss, i = state
         rel_change = jnp.abs(prev_loss - curr_loss) / (jnp.abs(prev_loss) + 1e-8)
         not_converged = jnp.logical_or(jnp.isinf(prev_loss), rel_change > tol)
         not_max_iters = i < n_iters
         return jnp.logical_and(not_converged, not_max_iters)
 
-    init_state = (centers, radii, opt_state, jnp.inf, init_loss, 0)
-    final_centers, final_radii, _, _, final_loss, n_steps = lax.while_loop(
+    init_state = (spheres, opt_state, jnp.inf, init_loss, jnp.array(0))
+    final_spheres, _, _, final_loss, n_steps = lax.while_loop(
         cond_fn, body_fn, init_state
     )
 
-    return final_centers, final_radii, init_loss, final_loss, n_steps
+    return final_spheres, init_loss, final_loss, n_steps  # type: ignore[return-value]
 
 
 # =============================================================================
@@ -671,17 +662,19 @@ def _refine_robot_spheres(
     for link_name in link_names:
         mesh = get_collision_mesh_for_link(urdf, link_name)
         if not mesh.is_empty:
-            link_points[link_name] = mesh.sample(p.n_samples)
+            link_points[link_name] = mesh.sample(p.n_samples)  # type: ignore[assignment]
         else:
             link_points[link_name] = np.zeros((0, 3))
 
     # Build flattened data
-    flat_data = _build_flattened_sphere_data(
+    flat_data, all_centers = _build_flattened_sphere_data(
         link_spheres, link_points, link_names, Ts, link_name_to_idx
     )
 
     if flat_data is None:
         return link_spheres
+
+    assert all_centers is not None  # guaranteed by above check
 
     # Build collision pair mask
     non_contiguous_pairs = get_non_contiguous_link_pairs(urdf, link_names)
@@ -705,23 +698,25 @@ def _refine_robot_spheres(
 
     collision_pair_mask, valid_pairs, skipped_pairs = _build_collision_pair_mask(
         flat_data.n_spheres,
-        flat_data.link_names,
-        flat_data.link_sphere_ranges,
+        list(flat_data.link_names),
+        list(flat_data.link_sphere_ranges),
         non_contiguous_pairs,
         mesh_distances,
         p.mesh_collision_tolerance,
     )
 
     if skipped_pairs:
-        logger.debug(f"Skipping {len(skipped_pairs)} link pairs with inherent mesh proximity")
+        logger.debug(
+            f"Skipping {len(skipped_pairs)} link pairs with inherent mesh proximity"
+        )
     logger.info(f"Checking self-collision for {len(valid_pairs)} link pairs")
 
-    # Build similarity pairs
+    # Build similarity pairs (using all_centers returned separately)
     similarity_pairs_array, similarity_pairs_list = _build_similarity_pairs(
         similarity_result,
-        flat_data.link_names,
-        flat_data.link_sphere_ranges,
-        flat_data.all_centers_list,
+        list(flat_data.link_names),
+        list(flat_data.link_sphere_ranges),
+        all_centers,
         p.lambda_similarity,
     )
 
@@ -739,25 +734,20 @@ def _refine_robot_spheres(
     else:
         logger.info(f"Self-collision: {initial_min_dist:.4f} clearance (initial)")
 
+    # Create refinement context
+    ctx = RobotRefineContext(
+        collision_pair_mask=collision_pair_mask,
+        similarity_pairs=similarity_pairs_array,
+        params=p,
+    )
+
     # Run optimization
-    final_centers, final_radii, init_loss, final_loss, n_steps = _run_robot_optimization(
-        flat_data.centers,
-        flat_data.radii,
-        flat_data.initial_centers,
-        flat_data.initial_radii,
-        flat_data.points_all,
-        flat_data.scale,
-        flat_data.n_links,
-        p,
+    final_spheres, init_loss, final_loss, n_steps = _run_robot_optimization(
+        flat_data,
+        ctx,
         p.lr,
         p.n_iters,
         p.tol,
-        flat_data.sphere_to_link,
-        flat_data.point_to_link,
-        flat_data.sphere_link_mask,
-        collision_pair_mask,
-        flat_data.sphere_transforms,
-        similarity_pairs_array,
     )
 
     logger.info(
@@ -766,14 +756,14 @@ def _refine_robot_spheres(
     )
 
     # Unflatten results
-    centers_np = np.array(final_centers)
-    radii_np = np.array(final_radii)
+    centers_np = np.array(final_spheres.center)
+    radii_np = np.array(final_spheres.radius)
 
     refined_link_spheres = _unflatten_to_link_spheres(
         centers_np,
         radii_np,
-        flat_data.link_names,
-        flat_data.link_sphere_ranges,
+        list(flat_data.link_names),
+        list(flat_data.link_sphere_ranges),
         link_spheres,
     )
 

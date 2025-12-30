@@ -376,10 +376,11 @@ class _SphereVisuals:
                     show_axes=False,
                 )
                 self._frames[key] = frame
+                center = sphere.center
                 self._handles[key] = self._server.scene.add_icosphere(
                     f"/sphere_frames/{key}/sphere",
-                    radius=sphere.radius,
-                    position=tuple(sphere.center),
+                    radius=float(sphere.radius),
+                    position=(float(center[0]), float(center[1]), float(center[2])),
                     color=rgb,
                     opacity=opacity,
                 )

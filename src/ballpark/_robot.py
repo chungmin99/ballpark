@@ -41,7 +41,7 @@ class RobotSpheresResult:
         data = {
             link_name: {
                 "centers": [s.center.tolist() for s in spheres],
-                "radii": [s.radius for s in spheres],
+                "radii": [float(s.radius) for s in spheres],
             }
             for link_name, spheres in self.link_spheres.items()
         }
@@ -366,9 +366,11 @@ def _compute_spheres_for_robot(
 
 def _transform_spheres(spheres: list[Sphere], transform: np.ndarray) -> list[Sphere]:
     """Apply 4x4 transform to sphere centers."""
+    import jax.numpy as jnp
+
     result = []
     for s in spheres:
         center_h = np.append(s.center, 1.0)
         new_center = (transform @ center_h)[:3]
-        result.append(Sphere(center=new_center, radius=s.radius))
+        result.append(Sphere(center=jnp.asarray(new_center), radius=s.radius))
     return result
