@@ -75,7 +75,7 @@ class RobotRefineContext:
 # =============================================================================
 
 
-def _compute_min_self_collision_distance(
+def compute_min_self_collision_distance(
     link_spheres: dict[str, list[Sphere]],
     all_link_names: list[str],
     joint_limits: tuple[np.ndarray, np.ndarray],
@@ -627,7 +627,7 @@ def _run_robot_optimization(
 # =============================================================================
 
 
-def _refine_robot_spheres(
+def refine_robot_spheres(
     link_spheres: dict[str, list[Sphere]],
     link_meshes: dict[str, trimesh.Trimesh],
     all_link_names: list[str],
@@ -744,7 +744,7 @@ def _refine_robot_spheres(
         )
 
     # Log initial self-collision distance (excludes adjacent links and inherently close meshes)
-    initial_min_dist = _compute_min_self_collision_distance(
+    initial_min_dist = compute_min_self_collision_distance(
         link_spheres,
         all_link_names,
         joint_limits,
@@ -792,7 +792,7 @@ def _refine_robot_spheres(
     )
 
     # Log final self-collision distance
-    final_min_dist = _compute_min_self_collision_distance(
+    final_min_dist = compute_min_self_collision_distance(
         refined_link_spheres,
         all_link_names,
         joint_limits,

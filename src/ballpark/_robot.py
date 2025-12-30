@@ -14,7 +14,7 @@ from loguru import logger
 from ._config import BallparkConfig, SpherePreset, SpherizeParams
 from ._spherize import Sphere, spherize
 from ._similarity import SimilarityResult, detect_similar_links
-from ._refine import _refine_robot_spheres, _compute_min_self_collision_distance
+from ._refine import refine_robot_spheres, compute_min_self_collision_distance
 from .utils._hash_geometry import get_link_collision_fingerprint
 
 
@@ -158,7 +158,9 @@ class Robot:
             # Extract rotation matrix and convert to quaternion (wxyz format)
             rot_matrix = T[:3, :3]
             quat_xyzw = Rotation.from_matrix(rot_matrix).as_quat()  # scipy uses xyzw
-            quat_wxyz = np.array([quat_xyzw[3], quat_xyzw[0], quat_xyzw[1], quat_xyzw[2]])
+            quat_wxyz = np.array(
+                [quat_xyzw[3], quat_xyzw[0], quat_xyzw[1], quat_xyzw[2]]
+            )
 
             # Extract translation
             translation = T[:3, 3]
@@ -285,7 +287,9 @@ class Robot:
         """
         # Build set of secondary links and compute multipliers for primaries
         secondary_links = set()
-        primary_multiplier: dict[str, int] = {}  # primary -> count of copies (including itself)
+        primary_multiplier: dict[
+            str, int
+        ] = {}  # primary -> count of copies (including itself)
 
         for group in self._similarity.groups:
             primary = group[0]
@@ -317,9 +321,7 @@ class Robot:
 
         return allocation
 
-    def _sync_similar_allocations(
-        self, allocation: dict[str, int]
-    ) -> dict[str, int]:
+    def _sync_similar_allocations(self, allocation: dict[str, int]) -> dict[str, int]:
         """
         Sync allocations for similar links to the maximum count in each group.
 
@@ -417,7 +419,7 @@ class Robot:
         """
         cfg = config or BallparkConfig.from_preset(SpherePreset.BALANCED)
 
-        refined_link_spheres = _refine_robot_spheres(
+        refined_link_spheres = refine_robot_spheres(
             spheres_result.link_spheres,
             self._link_meshes,
             self._all_link_names,
@@ -447,7 +449,7 @@ class Robot:
         Returns:
             Minimum signed distance. Negative = collision, positive = clearance.
         """
-        return _compute_min_self_collision_distance(
+        return compute_min_self_collision_distance(
             spheres_result.link_spheres,
             self._all_link_names,
             self.joint_limits,
