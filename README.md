@@ -21,8 +21,8 @@ We also include an interactive visualization and parameter adjusting GUI using [
 ## Installation
 
 ```bash
-pip install -e .  # base installation
-pip install -e ".[robot]"  # with robot URDF support, visualization, and CLI tools
+pip install -e .
+pip install -e ".[examples]"
 pip install -e ".[dev]"  # with development tools (linting, testing)
 ```
 
