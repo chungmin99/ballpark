@@ -14,8 +14,11 @@ from ballpark._spherize import compute_coverage
 from .conftest import (
     BUDGETS,
     MAX_VOLUME_OVERHEAD,
+    MAX_OVER_EXTENSION_RATIO,
     compute_tightness,
     compute_volume_overhead,
+    compute_over_extension,
+    assert_over_extension_below_maximum,
 )
 from .shapes import get_csg_shape_names, get_shape_by_name
 
@@ -153,4 +156,29 @@ class TestCSGQuality:
         assert quality >= min_quality, (
             f"{shape_name} quality {quality:.3f} (coverage={coverage:.3f}, "
             f"tightness={tightness:.3f}) below {min_quality} at budget {budget}"
+        )
+
+
+class TestCSGOverExtension:
+    """Test over-extension metric for CSG shapes."""
+
+    @pytest.mark.parametrize("shape_name", CSG_NAMES)
+    @pytest.mark.parametrize("budget", BUDGETS)
+    def test_over_extension_bounded(self, shape_name: str, budget: int):
+        """Verify spheres don't extend too far beyond mesh surface."""
+        spec = get_shape_by_name(shape_name)
+        if spec is None:
+            pytest.skip(f"CSG shape {shape_name} not available")
+
+        mesh = spec.factory()
+        spheres = spherize(mesh, target_spheres=budget)
+
+        over_ext = compute_over_extension(mesh, spheres)
+
+        # CSG shapes (often concave) allowed higher over-extension
+        max_ratio = MAX_OVER_EXTENSION_RATIO * 2.0
+        assert_over_extension_below_maximum(
+            over_ext["over_extension_ratio"],
+            max_ratio=max_ratio,
+            msg=f"for {shape_name} at budget {budget}",
         )

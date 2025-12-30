@@ -16,10 +16,13 @@ from .conftest import (
     BUDGETS,
     MIN_TIGHTNESS,
     MAX_VOLUME_OVERHEAD,
+    MAX_OVER_EXTENSION_RATIO,
     compute_tightness,
     compute_volume_overhead,
+    compute_over_extension,
     assert_tightness_above_minimum,
     assert_volume_overhead_below_maximum,
+    assert_over_extension_below_maximum,
 )
 from .shapes import get_primitive_shape_names, get_shape_by_name
 
@@ -173,4 +176,26 @@ class TestPrimitiveQuality:
         assert quality >= min_quality, (
             f"{shape_name} quality {quality:.3f} at budget {BUDGETS[-1]} "
             f"below minimum {min_quality}"
+        )
+
+
+class TestPrimitiveOverExtension:
+    """Test over-extension metric for primitive shapes."""
+
+    @pytest.mark.parametrize("shape_name", PRIMITIVE_NAMES)
+    @pytest.mark.parametrize("budget", BUDGETS)
+    def test_over_extension_bounded(self, shape_name: str, budget: int):
+        """Verify spheres don't extend too far beyond mesh surface."""
+        spec = get_shape_by_name(shape_name)
+        assert spec is not None
+
+        mesh = spec.factory()
+        spheres = spherize(mesh, target_spheres=budget)
+
+        over_ext = compute_over_extension(mesh, spheres)
+
+        assert_over_extension_below_maximum(
+            over_ext["over_extension_ratio"],
+            max_ratio=MAX_OVER_EXTENSION_RATIO,
+            msg=f"for {shape_name} at budget {budget}",
         )

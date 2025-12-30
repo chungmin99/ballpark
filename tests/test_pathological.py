@@ -27,6 +27,7 @@ from .conftest import (
     BUDGETS,
     compute_tightness,
     compute_volume_overhead,
+    compute_over_extension,
 )
 from .shapes import get_pathological_shape_names, get_shape_by_name
 
@@ -204,3 +205,31 @@ class TestPathologicalDocumentation:
 
         # Print for documentation
         print(f"\n{shape_name}: extents={extents}, aspect={aspect:.1f}:1")
+
+
+class TestPathologicalOverExtension:
+    """Test over-extension metric for pathological shapes (extremely permissive)."""
+
+    @pytest.mark.parametrize("shape_name", PATHOLOGICAL_NAMES)
+    @pytest.mark.parametrize("budget", BUDGETS)
+    def test_over_extension_extreme(self, shape_name: str, budget: int):
+        """Verify over-extension stays within extreme but bounded limits.
+
+        Pathological shapes with 15:1 to 100:1 aspect ratios will have
+        very high over-extension. This test documents the expected behavior.
+        """
+        spec = get_shape_by_name(shape_name)
+        assert spec is not None
+
+        mesh = spec.factory()
+        spheres = spherize(mesh, target_spheres=budget)
+
+        over_ext = compute_over_extension(mesh, spheres)
+
+        # Extremely permissive: allow up to 100x over-extension for pathological cases
+        max_ratio = 100.0
+        assert over_ext["over_extension_ratio"] <= max_ratio, (
+            f"{shape_name} over-extension {over_ext['over_extension_ratio']:.2f}x "
+            f"exceeds max {max_ratio}x at budget {budget}. "
+            f"This indicates catastrophic over-approximation."
+        )

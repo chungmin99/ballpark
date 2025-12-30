@@ -16,10 +16,13 @@ from .conftest import (
     BUDGETS,
     MIN_TIGHTNESS,
     MAX_VOLUME_OVERHEAD,
+    MAX_OVER_EXTENSION_RATIO,
     compute_tightness,
     compute_volume_overhead,
+    compute_over_extension,
     assert_tightness_above_minimum,
     assert_volume_overhead_below_maximum,
+    assert_over_extension_below_maximum,
 )
 from .shapes import get_compound_shape_names, get_shape_by_name
 
@@ -154,4 +157,28 @@ class TestCompoundQuality:
         assert quality >= min_quality, (
             f"{shape_name} quality {quality:.3f} (coverage={coverage:.3f}, "
             f"tightness={tightness:.3f}) below {min_quality} at budget {budget}"
+        )
+
+
+class TestCompoundOverExtension:
+    """Test over-extension metric for compound shapes."""
+
+    @pytest.mark.parametrize("shape_name", COMPOUND_NAMES)
+    @pytest.mark.parametrize("budget", BUDGETS)
+    def test_over_extension_bounded(self, shape_name: str, budget: int):
+        """Verify spheres don't extend too far beyond mesh surface."""
+        spec = get_shape_by_name(shape_name)
+        assert spec is not None
+
+        mesh = spec.factory()
+        spheres = spherize(mesh, target_spheres=budget)
+
+        over_ext = compute_over_extension(mesh, spheres)
+
+        # Compound shapes allowed slightly higher over-extension
+        max_ratio = MAX_OVER_EXTENSION_RATIO * 1.5
+        assert_over_extension_below_maximum(
+            over_ext["over_extension_ratio"],
+            max_ratio=max_ratio,
+            msg=f"for {shape_name} at budget {budget}",
         )
