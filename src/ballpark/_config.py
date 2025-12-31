@@ -109,6 +109,43 @@ class SpherizeParams:
     Start with 1.02-1.05 for most applications.
     """
 
+    # Volume sampling for thickness estimation
+    n_volume_samples: int = 1000
+    """Number of interior samples for thickness estimation (0 to disable).
+
+    Uses trimesh.sample.volume_mesh() to sample points inside the mesh.
+    These points help estimate local mesh thickness to cap sphere radii,
+    reducing over-extension where spheres extend beyond mesh boundaries.
+    Requires watertight mesh; falls back to surface-only if not watertight.
+    """
+
+    thickness_radius_scale: float = 1.2
+    """Allow sphere radius up to this factor of local thickness estimate.
+
+    Lower values = tighter fit, less over-extension, risk of under-coverage.
+    Higher values = looser fit, more over-extension, better coverage.
+    """
+
+    # Mesh containment check for over-extension control
+    containment_samples: int = 0
+    """Number of sphere surface samples for containment check (0 to disable).
+
+    Samples points uniformly on each sphere's surface and checks if they're
+    inside the mesh using trimesh.contains(). Shrinks sphere radius if too
+    many points are outside. Only works for watertight meshes.
+
+    WARNING: Enabling this can significantly reduce coverage, especially for
+    shapes with corners (like boxes). Use with caution.
+    """
+
+    min_containment_fraction: float = 0.50
+    """Minimum fraction of sphere surface that must be inside mesh.
+
+    Used with containment_samples. Binary search finds largest radius where
+    at least this fraction of sphere surface samples are inside the mesh.
+    Lower values = less aggressive capping, better coverage but more over-extension.
+    """
+
 
 @jdc.pytree_dataclass
 class RefineParams:
@@ -224,6 +261,12 @@ _PRESET_CONFIGS: dict[SpherePreset, BallparkConfig] = {
             prefer_symmetric_splits=True,
             symmetry_budget_tolerance=1.05,
             backtrack_threshold=1.0,
+            # Volume sampling for tighter fit
+            n_volume_samples=2000,
+            thickness_radius_scale=1.1,
+            # Containment check for tighter surface fit (reduces coverage!)
+            containment_samples=50,
+            min_containment_fraction=0.50,
         ),
         refine=RefineParams(
             lambda_under=2.0,  # Prioritize coverage
@@ -269,6 +312,11 @@ _PRESET_CONFIGS: dict[SpherePreset, BallparkConfig] = {
             prefer_symmetric_splits=False,
             symmetry_budget_tolerance=1.15,
             backtrack_threshold=1.05,
+            # Less aggressive volume sampling
+            n_volume_samples=500,
+            thickness_radius_scale=1.5,
+            # Containment check disabled for conservative mode (prioritize coverage)
+            containment_samples=0,
         ),
         refine=RefineParams(
             lambda_under=0.5,  # Less strict on coverage

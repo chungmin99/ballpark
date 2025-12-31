@@ -25,6 +25,7 @@ sys.path.insert(0, str(Path(__file__).parent.parent / "src"))
 sys.path.insert(0, str(Path(__file__).parent))
 
 from ballpark import spherize, Sphere, SPHERE_COLORS
+from ballpark._config import SpherizeParams
 from ballpark.metrics import (
     compute_coverage,
     compute_over_extension,
@@ -63,6 +64,7 @@ class _ShapesGui:
         self._last_category: str = "Primitives"
         self._last_shape: str = "cube"
         self._last_budget: int = 16
+        self._last_containment: bool = False
         self._last_opacity: float = 0.7
         self._last_show: bool = True
         self._needs_recompute = True
@@ -89,6 +91,11 @@ class _ShapesGui:
                 max=128,
                 step=1,
                 initial_value=16,
+            )
+            self._containment = server.gui.add_checkbox(
+                "Containment Check",
+                initial_value=False,
+                hint="Cap sphere radii to stay inside mesh (reduces over-extension but may reduce coverage)",
             )
             self._sphere_count = server.gui.add_number(
                 "Actual Spheres",
@@ -168,6 +175,11 @@ class _ShapesGui:
             self._last_budget = int(self._budget.value)
             self._needs_recompute = True
 
+        # Containment change
+        if self._containment.value != self._last_containment:
+            self._last_containment = self._containment.value
+            self._needs_recompute = True
+
         # Visibility/opacity change (visual only)
         if (
             self._show_spheres.value != self._last_show
@@ -193,6 +205,10 @@ class _ShapesGui:
     @property
     def show_spheres(self) -> bool:
         return bool(self._show_spheres.value)
+
+    @property
+    def containment(self) -> bool:
+        return bool(self._containment.value)
 
     @property
     def needs_recompute(self) -> bool:
@@ -319,13 +335,22 @@ def main() -> None:
                 current_centroid = current_mesh.centroid.copy()
                 points = np.asarray(current_mesh.sample(5000))
 
-                # Spherize
+                # Spherize with optional containment check
+                params = None
+                if gui.containment:
+                    params = SpherizeParams(
+                        containment_samples=50,
+                        min_containment_fraction=0.50,
+                    )
                 t0 = time.perf_counter()
-                current_spheres = spherize(current_mesh, target_spheres=gui.budget)
+                current_spheres = spherize(
+                    current_mesh, target_spheres=gui.budget, params=params
+                )
                 elapsed = (time.perf_counter() - t0) * 1000
+                containment_str = " [containment]" if gui.containment else ""
                 print(
                     f"[{spec.name}] Generated {len(current_spheres)} spheres "
-                    f"in {elapsed:.1f}ms"
+                    f"in {elapsed:.1f}ms{containment_str}"
                 )
 
                 # Compute metrics

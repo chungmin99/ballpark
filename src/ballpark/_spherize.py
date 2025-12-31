@@ -65,8 +65,25 @@ def spherize(
     detect_symmetry = p.detect_symmetry
     geometry_type = p.geometry_type
     prefer_symmetric_splits = p.prefer_symmetric_splits
+    n_volume_samples = p.n_volume_samples
+    thickness_radius_scale = p.thickness_radius_scale
+    containment_samples = p.containment_samples
+    min_containment_fraction = p.min_containment_fraction
 
     points = cast(np.ndarray, mesh.sample(n_samples))
+
+    # Sample interior/volume points for thickness estimation
+    volume_points: np.ndarray | None = None
+    if n_volume_samples > 0:
+        try:
+            if mesh.is_watertight:
+                volume_points = trimesh.sample.volume_mesh(mesh, n_volume_samples)
+                if len(volume_points) < 20:
+                    # Too sparse (very thin mesh), fall back to surface-only
+                    volume_points = None
+        except Exception:
+            # volume_mesh can fail for non-watertight or degenerate meshes
+            volume_points = None
 
     # Auto-enable symmetry detection for known primitives
     symmetry_info: SymmetryInfo | None = None
@@ -108,17 +125,31 @@ def spherize(
 
         return False
 
-    def split(pts, budget):
+    def split(pts, budget, vol_pts, target_mesh):
         if len(pts) < 15 or budget <= 0:
             if len(pts) > 0 and budget > 0:
-                s = fit_sphere_minmax(pts, padding, percentile)
+                s = fit_sphere_thickness_aware(
+                    pts, vol_pts, padding, percentile, thickness_radius_scale
+                )
                 s = jdc.replace(s, radius=min(s.radius, max_radius))  # cap radius
+                # Apply containment check to prevent over-extension
+                if containment_samples > 0 and target_mesh is not None:
+                    s = cap_radius_by_containment(
+                        s, target_mesh, containment_samples, min_containment_fraction
+                    )
                 return [s]
             return []
 
-        sphere = fit_sphere_minmax(pts, padding, percentile)
+        sphere = fit_sphere_thickness_aware(
+            pts, vol_pts, padding, percentile, thickness_radius_scale
+        )
 
         if not should_split(pts, sphere, budget):
+            # Apply containment check only to final (leaf) spheres
+            if containment_samples > 0 and target_mesh is not None:
+                sphere = cap_radius_by_containment(
+                    sphere, target_mesh, containment_samples, min_containment_fraction
+                )
             return [sphere]
 
         # Choose split axis (prefer symmetry planes if available)
@@ -161,9 +192,9 @@ def spherize(
 
         result = []
         if len(left) >= 10:
-            result.extend(split(left, left_budget))
+            result.extend(split(left, left_budget, vol_pts, target_mesh))
         if len(right) >= 10:
-            result.extend(split(right, right_budget))
+            result.extend(split(right, right_budget, vol_pts, target_mesh))
 
         if not result:
             return [sphere]
@@ -183,7 +214,7 @@ def spherize(
 
         return result
 
-    spheres = split(points, target_spheres)
+    spheres = split(points, target_spheres, volume_points, mesh)
 
     # Post-process: cap radius variance for more uniformity (may cause under-approximation)
     if uniform_radius and len(spheres) > 1:
@@ -195,6 +226,62 @@ def spherize(
         ]
 
     return spheres
+
+
+def fit_sphere_thickness_aware(
+    surface_points: np.ndarray,
+    volume_points: np.ndarray | None,
+    padding: float = 1.0,
+    percentile: float = 98.0,
+    thickness_scale: float = 1.2,
+) -> Sphere:
+    """
+    Fit a sphere with thickness-aware radius capping.
+
+    Uses interior/volume points to estimate local mesh thickness and caps
+    the sphere radius to avoid over-extension beyond the mesh boundary.
+
+    Args:
+        surface_points: (N, 3) array of surface points to enclose
+        volume_points: Optional (M, 3) array of interior points for thickness estimation
+        padding: Radius multiplier for safety margin
+        percentile: Percentile of distances to use for radius
+        thickness_scale: Allow radius up to this factor of thickness estimate
+
+    Returns:
+        Sphere that encloses the surface points, with radius capped by thickness
+    """
+    # Fit sphere to surface points using existing logic
+    base_sphere = fit_sphere_minmax(surface_points, padding, percentile)
+
+    if volume_points is None or len(volume_points) < 10:
+        return base_sphere
+
+    # Find volume points near this sphere's region
+    center = np.asarray(base_sphere.center)
+    base_radius = float(base_sphere.radius)
+    vol_dists = np.linalg.norm(volume_points - center, axis=1)
+
+    # Look for interior points within 2x the sphere radius
+    nearby_mask = vol_dists < base_radius * 2.0
+    n_nearby = nearby_mask.sum()
+
+    if n_nearby < 5:
+        return base_sphere  # No nearby interior points, can't estimate thickness
+
+    # Estimate thickness as 95th percentile distance to nearby interior points
+    # This represents how far solid material extends from the center
+    thickness_estimate = np.percentile(vol_dists[nearby_mask], 95)
+
+    # Cap radius based on thickness estimate
+    # thickness_scale allows some margin (default 1.2 = 20% larger than thickness)
+    max_radius = thickness_estimate * thickness_scale * padding
+    capped_radius = min(base_radius, max_radius)
+
+    # Ensure we don't shrink too aggressively (at least 50% of original)
+    capped_radius = max(capped_radius, base_radius * 0.5)
+
+    return Sphere(center=base_sphere.center, radius=jnp.asarray(capped_radius))
 
 
 def fit_sphere_minmax(
@@ -266,6 +353,211 @@ def _compute_sphere_bloat(points: np.ndarray, sphere: Sphere) -> float:
         return float(sphere_vol / (hull_vol + 1e-10))
     except (QhullError, ValueError):
         return 1.0
+
+
+def _fibonacci_sphere(n: int) -> np.ndarray:
+    """Generate n approximately uniform points on unit sphere.
+
+    Uses Fibonacci lattice for uniform distribution.
+
+    Args:
+        n: Number of points to generate
+
+    Returns:
+        (n, 3) array of unit vectors
+    """
+    if n <= 0:
+        return np.zeros((0, 3))
+    if n == 1:
+        return np.array([[0.0, 0.0, 1.0]])
+
+    indices = np.arange(n, dtype=float)
+    phi = np.pi * (3.0 - np.sqrt(5.0))  # golden angle
+
+    y = 1 - (indices / (n - 1)) * 2  # y goes from 1 to -1
+    radius_at_y = np.sqrt(1 - y * y)
+
+    theta = phi * indices
+    x = np.cos(theta) * radius_at_y
+    z = np.sin(theta) * radius_at_y
+
+    return np.column_stack([x, y, z])
+
+
+def _generate_center_candidates(
+    original_center: np.ndarray,
+    mesh: trimesh.Trimesh,
+    original_radius: float,
+    n_candidates: int = 7,
+) -> np.ndarray:
+    """Generate candidate center positions for multi-candidate containment search.
+
+    Generates candidates by:
+    1. Original center (baseline)
+    2. Shift toward mesh centroid (moves center inward)
+    3. Shift along local PCA axes (±directions)
+
+    Args:
+        original_center: Original sphere center (3,)
+        mesh: Mesh to check containment against
+        original_radius: Original sphere radius
+        n_candidates: Maximum number of candidates to generate
+
+    Returns:
+        (N, 3) array of candidate center positions
+    """
+    candidates = [original_center.copy()]
+
+    # 1. Shift toward mesh centroid (moves center inward for corner cases)
+    mesh_centroid = mesh.centroid
+    direction_to_centroid = mesh_centroid - original_center
+    dist_to_centroid = np.linalg.norm(direction_to_centroid)
+
+    if dist_to_centroid > 1e-6:
+        # Shift 30% toward centroid, capped at 0.3 * radius
+        shift_dist = min(0.3 * dist_to_centroid, 0.3 * original_radius)
+        shift_direction = direction_to_centroid / dist_to_centroid
+        candidates.append(original_center + shift_direction * shift_dist)
+
+    # 2. Shift along local PCA axes (both directions)
+    # Use mesh vertices near the sphere to compute local geometry
+    vertex_dists = np.linalg.norm(mesh.vertices - original_center, axis=1)
+    nearby_mask = vertex_dists < original_radius * 2.0
+    nearby_verts = mesh.vertices[nearby_mask]
+
+    if len(nearby_verts) >= 10:
+        pca = PCA(n_components=min(3, len(nearby_verts)))
+        pca.fit(nearby_verts - nearby_verts.mean(axis=0))
+
+        shift_dist = 0.2 * original_radius
+        for axis in pca.components_:
+            if len(candidates) >= n_candidates:
+                break
+            axis = axis / (np.linalg.norm(axis) + 1e-10)
+            candidates.append(original_center + axis * shift_dist)
+            if len(candidates) < n_candidates:
+                candidates.append(original_center - axis * shift_dist)
+
+    return np.array(candidates[:n_candidates])
+
+
+def _find_best_radius_at_center(
+    center: np.ndarray,
+    mesh: trimesh.Trimesh,
+    unit_sphere_points: np.ndarray,
+    max_radius: float,
+    min_fraction: float,
+    min_radius_ratio: float,
+) -> float:
+    """Binary search for largest valid radius at given center.
+
+    Args:
+        center: Center position to evaluate (3,)
+        mesh: Mesh to check containment against
+        unit_sphere_points: Pre-computed unit sphere sampling points (N, 3)
+        max_radius: Maximum radius to consider
+        min_fraction: Minimum fraction of points that must be inside mesh
+        min_radius_ratio: Minimum radius as fraction of max_radius
+
+    Returns:
+        Best radius found (largest that satisfies containment constraint)
+    """
+    lo = max_radius * min_radius_ratio
+    hi = max_radius
+    best_radius = lo
+
+    for _ in range(8):  # 8 iterations for good precision
+        mid = (lo + hi) / 2
+        test_points = center + unit_sphere_points * mid
+        inside = mesh.contains(test_points)
+        fraction_inside = inside.sum() / len(inside)
+
+        if fraction_inside >= min_fraction:
+            best_radius = mid
+            lo = mid
+        else:
+            hi = mid
+
+    return best_radius
+
+
+def cap_radius_by_containment(
+    sphere: Sphere,
+    mesh: trimesh.Trimesh,
+    n_samples: int = 50,
+    min_fraction: float = 0.85,
+    min_radius_ratio: float = 0.3,
+) -> Sphere:
+    """Cap sphere to stay within mesh bounds, adjusting center if beneficial.
+
+    Uses multi-candidate search to find the best (center, radius) pair that
+    maximizes coverage while satisfying containment constraints. This improves
+    coverage at mesh corners by allowing the center to shift inward.
+
+    Samples points uniformly on the sphere's surface and checks if they're
+    inside the mesh using trimesh.contains(). For each candidate center,
+    uses binary search to find the largest valid radius.
+
+    Args:
+        sphere: Sphere to potentially cap
+        mesh: Mesh to check containment against (must be watertight)
+        n_samples: Number of points to sample on sphere surface
+        min_fraction: Minimum fraction of points that must be inside mesh
+        min_radius_ratio: Minimum radius as fraction of original (prevents over-shrinking)
+
+    Returns:
+        Sphere with potentially adjusted center and radius
+    """
+    if not mesh.is_watertight or n_samples <= 0:
+        return sphere
+
+    original_center = np.asarray(sphere.center)
+    original_radius = float(sphere.radius)
+
+    # Sample points on unit sphere (Fibonacci lattice for uniformity)
+    unit_sphere_points = _fibonacci_sphere(n_samples)  # (N, 3) unit vectors
+
+    # First check if current radius is already valid
+    test_points = original_center + unit_sphere_points * original_radius
+    inside = mesh.contains(test_points)
+    fraction_inside = inside.sum() / len(inside)
+
+    if fraction_inside >= min_fraction:
+        return sphere  # Already valid, no need to adjust
+
+    # Generate candidate centers
+    candidates = _generate_center_candidates(
+        original_center, mesh, original_radius, n_candidates=7
+    )
+
+    best_center = original_center
+    best_radius = original_radius * min_radius_ratio
+    best_score = 0.0
+
+    for candidate_center in candidates:
+        # Find best radius at this center
+        radius = _find_best_radius_at_center(
+            candidate_center,
+            mesh,
+            unit_sphere_points,
+            original_radius,
+            min_fraction,
+            min_radius_ratio,
+        )
+
+        # Score by radius cubed (proxy for volume/coverage)
+        score = radius**3
+
+        if score > best_score:
+            best_center = candidate_center
+            best_radius = radius
+            best_score = score
+
+            # Early termination if we found a radius close to original
+            if best_radius > original_radius * 0.95:
+                break
+
+    return Sphere(center=jnp.asarray(best_center), radius=jnp.asarray(best_radius))
 
 
 def compute_coverage(points: np.ndarray, spheres: list[Sphere]) -> float:
