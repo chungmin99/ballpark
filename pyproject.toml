@@ -18,7 +18,7 @@ classifiers = [
     "Operating System :: OS Independent"
 ]
 dependencies = [
-    "numpy",
+    "numpy>=2.0,<2.4",  # <2.4 for yourdfpy compatibility
     "trimesh",
     "scikit-learn",
     "scipy",
