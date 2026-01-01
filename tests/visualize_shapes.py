@@ -26,10 +26,13 @@ sys.path.insert(0, str(Path(__file__).parent))
 
 from ballpark import spherize, Sphere, SPHERE_COLORS
 from ballpark._config import SpherizeParams
+from ballpark._primitives import detect_primitive, PrimitiveType
 from ballpark.metrics import (
     compute_coverage,
     compute_over_extension,
     compute_quality,
+    compute_regularity,
+    compute_symmetry_score,
     compute_tightness,
     compute_volume_overhead,
 )
@@ -65,6 +68,8 @@ class _ShapesGui:
         self._last_shape: str = "cube"
         self._last_budget: int = 16
         self._last_containment: bool = False
+        self._last_decomposition: bool = False
+        self._last_init_strategy: str = "adaptive"
         self._last_opacity: float = 0.7
         self._last_show: bool = True
         self._needs_recompute = True
@@ -85,6 +90,12 @@ class _ShapesGui:
             )
 
         with server.gui.add_folder("Spherization"):
+            self._init_strategy = server.gui.add_dropdown(
+                "Init Strategy",
+                options=["adaptive", "medial_axis"],
+                initial_value="adaptive",
+                hint="Initialization algorithm: adaptive (PCA split) or medial_axis (skeleton-based)",
+            )
             self._budget = server.gui.add_slider(
                 "Sphere Budget",
                 min=1,
@@ -97,10 +108,21 @@ class _ShapesGui:
                 initial_value=False,
                 hint="Cap sphere radii to stay inside mesh (reduces over-extension but may reduce coverage)",
             )
+            self._decomposition = server.gui.add_checkbox(
+                "Convex Decomposition",
+                initial_value=False,
+                hint="Decompose concave meshes into convex parts before spherizing (requires vhacdx)",
+            )
             self._sphere_count = server.gui.add_number(
                 "Actual Spheres",
                 initial_value=0.0001,
                 disabled=True,
+            )
+            self._primitive_type = server.gui.add_text(
+                "Detected Primitive",
+                initial_value="",
+                disabled=True,
+                hint="Automatically detected primitive type (box, cylinder, capsule, sphere, or unknown)",
             )
 
         with server.gui.add_folder("Visualization"):
@@ -148,6 +170,26 @@ class _ShapesGui:
                 hint="Volume inside spheres but outside mesh, as ratio of mesh volume. Lower is better (0 = perfect).",
             )
 
+        with server.gui.add_folder("Regularity Metrics"):
+            self._radius_uniformity = server.gui.add_number(
+                "Radius Uniformity ↑",
+                initial_value=0.0001,
+                disabled=True,
+                hint="1 - (std/mean) of radii. Higher = more uniform sphere sizes (0-1).",
+            )
+            self._spacing_uniformity = server.gui.add_number(
+                "Spacing Uniformity ↑",
+                initial_value=0.0001,
+                disabled=True,
+                hint="1 - (std/mean) of inter-sphere distances. Higher = more regular grid (0-1).",
+            )
+            self._symmetry_score = server.gui.add_number(
+                "Symmetry Score ↑",
+                initial_value=0.0001,
+                disabled=True,
+                hint="Best reflection symmetry across XY/XZ/YZ planes (0-1). Higher = more symmetric placement.",
+            )
+
     def _get_shape_names_for_category(self, category: str) -> list[str]:
         """Get shape names for a category."""
         shapes = self._shapes_by_category.get(category, [])
@@ -178,6 +220,16 @@ class _ShapesGui:
         # Containment change
         if self._containment.value != self._last_containment:
             self._last_containment = self._containment.value
+            self._needs_recompute = True
+
+        # Decomposition change
+        if self._decomposition.value != self._last_decomposition:
+            self._last_decomposition = self._decomposition.value
+            self._needs_recompute = True
+
+        # Init strategy change
+        if self._init_strategy.value != self._last_init_strategy:
+            self._last_init_strategy = self._init_strategy.value
             self._needs_recompute = True
 
         # Visibility/opacity change (visual only)
@@ -211,6 +263,14 @@ class _ShapesGui:
         return bool(self._containment.value)
 
     @property
+    def decomposition(self) -> bool:
+        return bool(self._decomposition.value)
+
+    @property
+    def init_strategy(self) -> str:
+        return str(self._init_strategy.value)
+
+    @property
     def needs_recompute(self) -> bool:
         return self._needs_recompute
 
@@ -232,6 +292,10 @@ class _ShapesGui:
         overhead: float,
         over_extension: float,
         count: int,
+        radius_uniformity: float,
+        spacing_uniformity: float,
+        symmetry: float,
+        primitive_type: str,
     ) -> None:
         """Update the metrics display."""
         self._coverage.value = round(coverage, 4)
@@ -240,6 +304,10 @@ class _ShapesGui:
         self._volume_overhead.value = round(overhead, 2)
         self._over_extension.value = round(over_extension, 2)
         self._sphere_count.value = count
+        self._radius_uniformity.value = round(radius_uniformity, 4)
+        self._spacing_uniformity.value = round(spacing_uniformity, 4)
+        self._symmetry_score.value = round(symmetry, 4)
+        self._primitive_type.value = primitive_type
 
 
 class _ShapeVisuals:
@@ -335,22 +403,39 @@ def main() -> None:
                 current_centroid = current_mesh.centroid.copy()
                 points = np.asarray(current_mesh.sample(5000))
 
-                # Spherize with optional containment check
-                params = None
-                if gui.containment:
-                    params = SpherizeParams(
-                        containment_samples=50,
-                        min_containment_fraction=0.50,
-                    )
+                # Detect primitive type
+                primitive_info = detect_primitive(current_mesh)
+                primitive_name = primitive_info.primitive_type.name.lower()
+                if primitive_info.confidence < 0.7:
+                    primitive_name = f"{primitive_name} ({primitive_info.confidence:.0%})"
+
+                # Build params with optional features
+                params = SpherizeParams(
+                    init_strategy=gui.init_strategy,  # type: ignore[arg-type]
+                    containment_samples=50 if gui.containment else 0,
+                    min_containment_fraction=0.50,
+                    use_decomposition=gui.decomposition,
+                )
+
                 t0 = time.perf_counter()
                 current_spheres = spherize(
                     current_mesh, target_spheres=gui.budget, params=params
                 )
                 elapsed = (time.perf_counter() - t0) * 1000
-                containment_str = " [containment]" if gui.containment else ""
+
+                # Build feature string for logging
+                features = []
+                if gui.init_strategy != "adaptive":
+                    features.append(gui.init_strategy)
+                if gui.containment:
+                    features.append("containment")
+                if gui.decomposition:
+                    features.append("decomposition")
+                feature_str = f" [{', '.join(features)}]" if features else ""
+
                 print(
                     f"[{spec.name}] Generated {len(current_spheres)} spheres "
-                    f"in {elapsed:.1f}ms{containment_str}"
+                    f"in {elapsed:.1f}ms{feature_str}"
                 )
 
                 # Compute metrics
@@ -359,6 +444,8 @@ def main() -> None:
                 overhead = compute_volume_overhead(points, current_spheres)
                 quality = compute_quality(coverage, tightness)
                 over_ext = compute_over_extension(current_mesh, current_spheres)
+                regularity = compute_regularity(current_spheres)
+                symmetry = compute_symmetry_score(current_spheres, points)
 
                 gui.update_metrics(
                     coverage,
@@ -367,6 +454,10 @@ def main() -> None:
                     overhead,
                     over_ext["over_extension_ratio"],
                     len(current_spheres),
+                    regularity["radius_uniformity"],
+                    regularity["spacing_uniformity"],
+                    symmetry["overall_symmetry"],
+                    primitive_name,
                 )
 
                 # Update visuals
