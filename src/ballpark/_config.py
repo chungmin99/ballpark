@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from enum import Enum
+from typing import Literal
 
 import jax_dataclasses as jdc
 
@@ -144,6 +145,57 @@ class SpherizeParams:
     Used with containment_samples. Binary search finds largest radius where
     at least this fraction of sphere surface samples are inside the mesh.
     Lower values = less aggressive capping, better coverage but more over-extension.
+    """
+
+    # Convex decomposition
+    use_decomposition: bool = False
+    """Whether to use convex decomposition for concave meshes.
+
+    When enabled, concave meshes are decomposed into convex parts using V-HACD
+    (if available), and each part is spherized independently. This can improve
+    coverage for complex concave shapes.
+
+    Requires the 'decomposition' optional dependency (pip install ballpark[decomposition]).
+    """
+
+    decomposition_threshold: float = 0.9
+    """Volume ratio threshold for triggering decomposition.
+
+    A mesh is considered concave (and decomposed) if mesh_volume / hull_volume
+    is below this threshold. Higher = more aggressive decomposition.
+    """
+
+    max_decomposition_parts: int = 16
+    """Maximum number of convex parts from decomposition."""
+
+    # Initialization strategy
+    init_strategy: Literal["adaptive", "medial_axis"] = "adaptive"
+    """Sphere initialization strategy.
+
+    - "adaptive": PCA-based recursive splitting (default, current algorithm)
+    - "medial_axis": Medial Axis Transform based placement (better for tubular shapes)
+    """
+
+    # MAT-specific parameters
+    mat_voxel_resolution: int = 48
+    """Voxel grid resolution for MAT computation (32-64 typical).
+
+    Higher values give finer skeleton detail but increase computation time.
+    Lower = faster, higher = finer detail. Only used when init_strategy="medial_axis".
+    """
+
+    mat_skeleton_sampling: float = 1.0
+    """Fraction of skeleton points to consider as sphere candidates.
+
+    1.0 = all skeleton points, 0.5 = sample half. Lower values speed up
+    greedy selection. Only used when init_strategy="medial_axis".
+    """
+
+    mat_min_radius_ratio: float = 0.02
+    """Minimum sphere radius as fraction of mesh extent.
+
+    Skeleton points with smaller inscribed radii are filtered out.
+    Prevents tiny spheres in thin regions. Only used when init_strategy="medial_axis".
     """
 
 

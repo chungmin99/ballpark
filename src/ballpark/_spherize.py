@@ -35,8 +35,11 @@ def spherize(
     """
     Adaptive splitting with tight sphere fitting.
 
-    Uses budget-based recursion to target the specified sphere count.
-    Splits regions that are too elongated or have poor tightness.
+    Uses a hybrid approach:
+    1. Detect if mesh is a primitive (box, cylinder, capsule, sphere)
+    2. For primitives: use optimal hardcoded decomposition
+    3. For general meshes: use adaptive splitting with tight sphere fitting
+
     The actual number of spheres may slightly exceed target_spheres due to
     minimum allocation constraints during recursive splitting.
 
@@ -51,8 +54,66 @@ def spherize(
     # Import here to avoid circular import
     from ._config import SpherizeParams
     from ._symmetry import get_primitive_symmetry_planes, SymmetryInfo
+    from ._primitives import detect_primitive, spherize_primitive, PrimitiveType
 
     p = params or SpherizeParams()
+
+    # Strategy dispatch - MAT initialization
+    if p.init_strategy == "medial_axis":
+        from ._medial_axis import spherize_medial_axis
+
+        spheres = spherize_medial_axis(mesh, target_spheres, p)
+        if spheres:
+            # Apply existing post-processing (containment, uniform radius)
+            if p.containment_samples > 0 and mesh.is_watertight:
+                spheres = [
+                    cap_radius_by_containment(
+                        s, mesh, p.containment_samples, p.min_containment_fraction
+                    )
+                    for s in spheres
+                ]
+
+            if p.uniform_radius and len(spheres) > 1:
+                radii = np.array([s.radius for s in spheres])
+                median_radius = np.median(radii)
+                spheres = [
+                    jdc.replace(
+                        s, radius=np.clip(s.radius, median_radius * 0.4, median_radius * 2.5)
+                    )
+                    for s in spheres
+                ]
+
+            return spheres
+        # Fall through to adaptive if MAT returns empty
+
+    # Try primitive detection first (unless geometry_type is explicitly set)
+    # Only use for small-medium budgets where primitive decomposition is effective
+    if p.geometry_type is None and target_spheres <= 32:
+        primitive_info = detect_primitive(mesh)
+        if primitive_info.primitive_type != PrimitiveType.UNKNOWN and primitive_info.confidence >= 0.7:
+            # Use optimal hardcoded decomposition for detected primitive
+            spheres = spherize_primitive(primitive_info, target_spheres, p.padding)
+            if spheres:
+                # Quick quality check - ensure reasonable coverage
+                test_points = cast(np.ndarray, mesh.sample(1000))
+                coverage = compute_coverage(test_points, spheres)
+                if coverage >= 0.85:  # Primitive spherization is good enough
+                    return spheres
+                # Otherwise fall through to general algorithm
+
+    # Try convex decomposition for concave meshes (if enabled)
+    if p.use_decomposition and mesh.is_watertight:
+        from ._decompose import needs_decomposition, spherize_decomposed
+
+        if needs_decomposition(mesh, threshold=p.decomposition_threshold):
+            decomposed_spheres = spherize_decomposed(
+                mesh,
+                target_spheres,
+                params=params,
+                max_parts=p.max_decomposition_parts,
+            )
+            if decomposed_spheres:
+                return decomposed_spheres
 
     # Unpack params
     target_tightness = p.target_tightness
