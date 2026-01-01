@@ -344,6 +344,16 @@ class _SpheresGui:
                 self._params_sliders["uniform_radius"] = self._server.gui.add_checkbox(
                     "uniform_radius", initial_value=cfg.spherize.uniform_radius,
                 )
+                self._params_sliders["axis_mode"] = self._server.gui.add_dropdown(
+                    "axis_mode",
+                    options=["aligned", "pca"],
+                    initial_value=cfg.spherize.axis_mode,
+                )
+                self._params_sliders["symmetry_mode"] = self._server.gui.add_dropdown(
+                    "symmetry_mode",
+                    options=["auto", "off", "force"],
+                    initial_value=cfg.spherize.symmetry_mode,
+                )
 
             # Refine optimization parameters
             with self._server.gui.add_folder("Optimization"):
@@ -453,6 +463,8 @@ class _SpheresGui:
                 percentile=float(p["percentile"].value),
                 max_radius_ratio=float(p["max_radius_ratio"].value),
                 uniform_radius=bool(p["uniform_radius"].value),
+                axis_mode=str(p["axis_mode"].value),
+                symmetry_mode=str(p["symmetry_mode"].value),
             ),
             refine=RefineParams(
                 lr=float(p["lr"].value),
