@@ -6,6 +6,7 @@ from typing import TYPE_CHECKING
 
 import numpy as np
 from scipy.spatial import ConvexHull, QhullError
+from scipy.spatial.distance import cdist
 import trimesh
 
 # Re-export compute_coverage from _spherize (canonical implementation)
@@ -182,4 +183,215 @@ def compute_over_extension(
         "over_extension_volume": over_extension_volume,
         "over_extension_ratio": over_extension_ratio,
         "mesh_volume": mesh_volume,
+    }
+
+
+def compute_regularity(spheres: list["Sphere"]) -> dict[str, float]:
+    """
+    Compute regularity/uniformity metrics for sphere placement.
+
+    Regularity measures how organized vs chaotic the sphere placement is.
+    Higher values indicate more regular, uniform placement.
+
+    Metrics computed:
+    - radius_uniformity: 1 - (std/mean) of radii. Higher = more uniform sizes.
+    - spacing_uniformity: 1 - (std/mean) of inter-sphere distances. Higher = more regular grid.
+    - overall_regularity: Combined score (average of above).
+
+    Args:
+        spheres: List of Sphere objects
+
+    Returns:
+        Dictionary with regularity metrics
+    """
+    if len(spheres) < 2:
+        return {
+            "radius_uniformity": 1.0,
+            "spacing_uniformity": 1.0,
+            "overall_regularity": 1.0,
+        }
+
+    # Extract radii and centers
+    radii = np.array([float(s.radius) for s in spheres])
+    centers = np.array([np.array(s.center) for s in spheres])
+
+    # Radius uniformity: 1 - coefficient of variation
+    radius_mean = radii.mean()
+    radius_std = radii.std()
+    if radius_mean > 1e-10:
+        radius_cv = radius_std / radius_mean
+        radius_uniformity = max(0.0, 1.0 - radius_cv)
+    else:
+        radius_uniformity = 0.0
+
+    # Spacing uniformity: analyze distances between sphere centers
+    if len(spheres) >= 2:
+        # Compute pairwise distances
+        distances = cdist(centers, centers)
+        # Get distances to nearest neighbor (excluding self)
+        np.fill_diagonal(distances, np.inf)
+        nearest_dists = distances.min(axis=1)
+
+        spacing_mean = nearest_dists.mean()
+        spacing_std = nearest_dists.std()
+        if spacing_mean > 1e-10:
+            spacing_cv = spacing_std / spacing_mean
+            spacing_uniformity = max(0.0, 1.0 - spacing_cv)
+        else:
+            spacing_uniformity = 0.0
+    else:
+        spacing_uniformity = 1.0
+
+    # Overall regularity: average of uniformity scores
+    overall_regularity = (radius_uniformity + spacing_uniformity) / 2
+
+    return {
+        "radius_uniformity": float(radius_uniformity),
+        "spacing_uniformity": float(spacing_uniformity),
+        "overall_regularity": float(overall_regularity),
+    }
+
+
+def compute_symmetry_score(
+    spheres: list["Sphere"],
+    points: np.ndarray | None = None,
+    tolerance: float = 0.1,
+) -> dict[str, float]:
+    """
+    Compute how well the sphere placement respects mesh symmetry.
+
+    Tests reflection symmetry across principal planes (XY, XZ, YZ) and
+    measures how well sphere positions mirror across these planes.
+
+    Args:
+        spheres: List of Sphere objects
+        points: Optional (N, 3) array of mesh surface points for reference
+        tolerance: Relative tolerance for symmetry matching
+
+    Returns:
+        Dictionary with symmetry scores:
+        - xy_symmetry: Symmetry score for reflection across XY plane
+        - xz_symmetry: Symmetry score for reflection across XZ plane
+        - yz_symmetry: Symmetry score for reflection across YZ plane
+        - overall_symmetry: Best of the three plane symmetries
+    """
+    if len(spheres) < 2:
+        return {
+            "xy_symmetry": 1.0,
+            "xz_symmetry": 1.0,
+            "yz_symmetry": 1.0,
+            "overall_symmetry": 1.0,
+        }
+
+    centers = np.array([np.array(s.center) for s in spheres])
+    radii = np.array([float(s.radius) for s in spheres])
+
+    # Compute centroid
+    centroid = centers.mean(axis=0)
+    centered = centers - centroid
+
+    # Compute bounding box for tolerance scaling
+    extent = centered.max(axis=0) - centered.min(axis=0)
+    scale = max(extent.max(), 1e-10)
+    abs_tolerance = tolerance * scale
+
+    def test_reflection_symmetry(axis_idx: int) -> float:
+        """Test symmetry by reflecting points across a plane."""
+        # Reflect across plane perpendicular to axis
+        reflected = centered.copy()
+        reflected[:, axis_idx] *= -1
+
+        # For each reflected point, find best matching original
+        total_match = 0.0
+        for i in range(len(centered)):
+            ref_pt = reflected[i]
+            ref_radius = radii[i]
+
+            # Find closest original point
+            dists = np.linalg.norm(centered - ref_pt, axis=1)
+            closest_idx = np.argmin(dists)
+            min_dist = dists[closest_idx]
+
+            # Check if position and radius match
+            if min_dist < abs_tolerance:
+                radius_error = abs(radii[closest_idx] - ref_radius) / (ref_radius + 1e-10)
+                if radius_error < tolerance:
+                    total_match += 1.0
+                else:
+                    total_match += max(0.0, 1.0 - radius_error)
+
+        return total_match / len(spheres)
+
+    # Test symmetry across each plane
+    xy_sym = test_reflection_symmetry(2)  # Reflect across XY (flip Z)
+    xz_sym = test_reflection_symmetry(1)  # Reflect across XZ (flip Y)
+    yz_sym = test_reflection_symmetry(0)  # Reflect across YZ (flip X)
+
+    # Overall: use best symmetry score
+    overall_sym = max(xy_sym, xz_sym, yz_sym)
+
+    return {
+        "xy_symmetry": float(xy_sym),
+        "xz_symmetry": float(xz_sym),
+        "yz_symmetry": float(yz_sym),
+        "overall_symmetry": float(overall_sym),
+    }
+
+
+def compute_all_metrics(
+    mesh: trimesh.Trimesh,
+    spheres: list["Sphere"],
+    n_samples: int = 5000,
+) -> dict[str, float]:
+    """
+    Compute all quality metrics for a sphere decomposition.
+
+    This is a convenience function that computes all available metrics
+    in one call.
+
+    Args:
+        mesh: Original mesh
+        spheres: List of Sphere objects
+        n_samples: Number of surface samples for coverage computation
+
+    Returns:
+        Dictionary with all metrics:
+        - coverage: Fraction of surface points covered
+        - tightness: hull_vol / sphere_vol
+        - volume_overhead: sphere_vol / hull_vol
+        - quality: coverage * tightness
+        - over_extension_ratio: volume outside mesh / mesh volume
+        - radius_uniformity: Uniformity of sphere radii
+        - spacing_uniformity: Uniformity of sphere spacing
+        - overall_regularity: Combined regularity score
+        - overall_symmetry: Best plane symmetry score
+    """
+    # Sample surface points
+    points = np.asarray(mesh.sample(n_samples))
+
+    # Core metrics
+    coverage = compute_coverage(points, spheres)
+    tightness = compute_tightness(points, spheres)
+    volume_overhead = compute_volume_overhead(points, spheres)
+    quality = compute_quality(coverage, tightness)
+
+    # Over-extension
+    over_ext = compute_over_extension(mesh, spheres)
+
+    # Regularity
+    regularity = compute_regularity(spheres)
+
+    # Symmetry
+    symmetry = compute_symmetry_score(spheres, points)
+
+    return {
+        "coverage": coverage,
+        "tightness": tightness,
+        "volume_overhead": volume_overhead,
+        "quality": quality,
+        "over_extension_ratio": over_ext["over_extension_ratio"],
+        "radius_uniformity": regularity["radius_uniformity"],
+        "spacing_uniformity": regularity["spacing_uniformity"],
+        "overall_regularity": regularity["overall_regularity"],
+        "overall_symmetry": symmetry["overall_symmetry"],
     }
