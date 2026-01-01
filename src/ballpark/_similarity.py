@@ -31,10 +31,38 @@ class SimilarityResult:
     transforms: dict[tuple[str, str], np.ndarray] = field(default_factory=dict)
 
 
+def _find_mirror_axis(centered_a: np.ndarray, centered_b: np.ndarray) -> int | None:
+    """Check if meshes are mirrors of each other along a single axis.
+
+    Args:
+        centered_a: Vertices of mesh A centered at origin
+        centered_b: Vertices of mesh B centered at origin
+
+    Returns:
+        Axis index (0=X, 1=Y, 2=Z) if mirrored, None otherwise
+    """
+    # Sort vertices for comparison (order-independent matching)
+    sorted_a = np.sort(centered_a, axis=0)
+
+    for axis in range(3):
+        # Flip this axis in B
+        flipped_b = centered_b.copy()
+        flipped_b[:, axis] *= -1
+        sorted_flipped_b = np.sort(flipped_b, axis=0)
+
+        if np.allclose(sorted_a, sorted_flipped_b, atol=1e-6):
+            return axis
+
+    return None
+
+
 def _compute_alignment_transform(mesh_a, mesh_b) -> np.ndarray:
     """Compute 4x4 transform that aligns mesh_a to mesh_b.
 
-    Uses centroid alignment + PCA-based rotation alignment.
+    Handles three cases:
+    1. Identical meshes: translation only
+    2. Mirrored meshes: reflection + translation
+    3. Rotated meshes: PCA-based rotation + translation
 
     Returns:
         4x4 homogeneous transform matrix T such that T @ point_in_a ≈ point_in_b
@@ -42,32 +70,45 @@ def _compute_alignment_transform(mesh_a, mesh_b) -> np.ndarray:
     if mesh_a.is_empty or mesh_b.is_empty:
         return np.eye(4)
 
-    # Centroid translation
     centroid_a = mesh_a.centroid
     centroid_b = mesh_b.centroid
 
-    # PCA for rotation alignment
     centered_a = mesh_a.vertices - centroid_a
     centered_b = mesh_b.vertices - centroid_b
 
-    # Compute principal axes via SVD
+    # Case 1: Check if meshes are identical (just translated)
+    sorted_a = np.sort(centered_a, axis=0)
+    sorted_b = np.sort(centered_b, axis=0)
+    if np.allclose(sorted_a, sorted_b, atol=1e-6):
+        T = np.eye(4)
+        T[:3, 3] = centroid_b - centroid_a
+        return T
+
+    # Case 2: Check if meshes are mirrored along a single axis
+    mirror_axis = _find_mirror_axis(centered_a, centered_b)
+    if mirror_axis is not None:
+        # Build reflection matrix: flip the mirror axis
+        T = np.eye(4)
+        T[mirror_axis, mirror_axis] = -1.0
+        # Translation: account for reflection of centroid_a
+        reflected_centroid_a = centroid_a.copy()
+        reflected_centroid_a[mirror_axis] *= -1.0
+        T[:3, 3] = centroid_b - reflected_centroid_a
+        return T
+
+    # Case 3: Fall back to PCA-based rotation alignment
     _, _, Vt_a = np.linalg.svd(centered_a, full_matrices=False)
     _, _, Vt_b = np.linalg.svd(centered_b, full_matrices=False)
 
     # Rotation from A's frame to B's frame
-    # V_a.T @ point_centered_a = point_in_pca_frame
-    # V_b @ point_in_pca_frame = point_centered_b
-    # So: rotation = V_b @ V_a.T
     rotation_matrix = Vt_b.T @ Vt_a
 
     # Handle reflection (ensure proper rotation, det = 1)
     if np.linalg.det(rotation_matrix) < 0:
-        # Flip the last axis to make it a proper rotation
         Vt_a_fixed = Vt_a.copy()
         Vt_a_fixed[2] = -Vt_a_fixed[2]
         rotation_matrix = Vt_b.T @ Vt_a_fixed
 
-    # Build 4x4 transform: translate to origin, rotate, translate to B
     T = np.eye(4)
     T[:3, :3] = rotation_matrix
     T[:3, 3] = centroid_b - rotation_matrix @ centroid_a
