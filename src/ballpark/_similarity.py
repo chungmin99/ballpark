@@ -76,16 +76,20 @@ def _compute_alignment_transform(mesh_a, mesh_b) -> np.ndarray:
     centered_a = mesh_a.vertices - centroid_a
     centered_b = mesh_b.vertices - centroid_b
 
+    # Only do vertex-by-vertex comparison if meshes have same vertex count
+    same_vertex_count = len(mesh_a.vertices) == len(mesh_b.vertices)
+
     # Case 1: Check if meshes are identical (just translated)
-    sorted_a = np.sort(centered_a, axis=0)
-    sorted_b = np.sort(centered_b, axis=0)
-    if np.allclose(sorted_a, sorted_b, atol=1e-6):
-        T = np.eye(4)
-        T[:3, 3] = centroid_b - centroid_a
-        return T
+    if same_vertex_count:
+        sorted_a = np.sort(centered_a, axis=0)
+        sorted_b = np.sort(centered_b, axis=0)
+        if np.allclose(sorted_a, sorted_b, atol=1e-6):
+            T = np.eye(4)
+            T[:3, 3] = centroid_b - centroid_a
+            return T
 
     # Case 2: Check if meshes are mirrored along a single axis
-    mirror_axis = _find_mirror_axis(centered_a, centered_b)
+    mirror_axis = _find_mirror_axis(centered_a, centered_b) if same_vertex_count else None
     if mirror_axis is not None:
         # Build reflection matrix: flip the mirror axis
         T = np.eye(4)
