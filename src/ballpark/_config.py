@@ -54,6 +54,15 @@ class SpherizeParams:
     axis_mode: str = "aligned"
     """Split direction: 'aligned' (axis with max variance), 'pca' (arbitrary principal axis)."""
 
+    symmetry_mode: str = "auto"
+    """Symmetry handling: 'auto' (detect), 'off' (disabled), 'force' (always assume symmetric)."""
+
+    symmetry_tolerance: float = 0.05
+    """Tolerance for approximate symmetry detection (0.0 = perfect, 0.1 = 10% deviation)."""
+
+    odd_budget_mode: str = "round_up"
+    """How to handle odd sphere budgets: 'round_up' (add +1) or 'center' (place one on plane)."""
+
 
 @jdc.pytree_dataclass
 class RefineParams:
