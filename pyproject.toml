@@ -21,6 +21,7 @@ dependencies = [
     "numpy",
     "trimesh",
     "scikit-learn",
+    "scikit-image>=0.20.0",
     "scipy",
     "jax>=0.4.0",
     "jax_dataclasses",
@@ -36,6 +37,9 @@ examples = [
     "robot_descriptions",
     "tyro",
     "viser",
+]
+decomposition = [
+    "vhacdx",
 ]
 dev = [
     "pyright>=1.1.308",
