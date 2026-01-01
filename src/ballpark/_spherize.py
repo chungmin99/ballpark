@@ -100,10 +100,17 @@ def spherize(
         if not should_split(pts, sphere, budget):
             return [sphere]
 
-        # Split along principal axis
-        pca = PCA(n_components=1)
-        pca.fit(pts)
-        proj = pts @ pca.components_[0]
+        # Split along chosen axis
+        if p.axis_mode == "aligned":
+            # Split along axis with highest variance (X=0, Y=1, Z=2)
+            variances = pts.var(axis=0)
+            axis = int(np.argmax(variances))
+            proj = pts[:, axis]
+        else:  # "pca" - original behavior
+            pca = PCA(n_components=1)
+            pca.fit(pts)
+            proj = pts @ pca.components_[0]
+
         # Blend median with geometric midpoint for more symmetric splits
         proj_mid = (proj.min() + proj.max()) / 2
         split_point = 0.5 * np.median(proj) + 0.5 * proj_mid

@@ -51,6 +51,9 @@ class SpherizeParams:
     uniform_radius: bool = False
     """If True, post-process to make radii more uniform."""
 
+    axis_mode: str = "aligned"
+    """Split direction: 'aligned' (axis with max variance), 'pca' (arbitrary principal axis)."""
+
 
 @jdc.pytree_dataclass
 class RefineParams:
