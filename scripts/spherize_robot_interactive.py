@@ -354,6 +354,10 @@ class _SpheresGui:
                     options=["auto", "off", "force"],
                     initial_value=cfg.spherize.symmetry_mode,
                 )
+                self._params_sliders["symmetry_tolerance"] = self._server.gui.add_slider(
+                    "symmetry_tolerance", min=0.01, max=0.2, step=0.01,
+                    initial_value=cfg.spherize.symmetry_tolerance,
+                )
 
             # Refine optimization parameters
             with self._server.gui.add_folder("Optimization"):
@@ -465,6 +469,7 @@ class _SpheresGui:
                 uniform_radius=bool(p["uniform_radius"].value),
                 axis_mode=str(p["axis_mode"].value),
                 symmetry_mode=str(p["symmetry_mode"].value),
+                symmetry_tolerance=float(p["symmetry_tolerance"].value),
             ),
             refine=RefineParams(
                 lr=float(p["lr"].value),
