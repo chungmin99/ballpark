@@ -155,6 +155,67 @@ def _fit_center_sphere(
     return Sphere(center=jnp.asarray(center_on_plane), radius=jnp.asarray(radius))
 
 
+def _mirror_sphere(
+    sphere: Sphere, axis: np.ndarray, centroid: np.ndarray
+) -> Sphere:
+    """
+    Mirror a sphere across a symmetry plane.
+
+    The symmetry plane passes through `centroid` with normal `axis`.
+
+    Args:
+        sphere: Sphere to mirror
+        axis: Unit normal of the symmetry plane
+        centroid: A point on the symmetry plane
+
+    Returns:
+        New Sphere with center mirrored across the plane
+    """
+    center = np.asarray(sphere.center)
+    # Vector from centroid to sphere center
+    offset = center - centroid
+    # Project offset onto axis
+    proj = np.dot(offset, axis)
+    # Reflect: subtract twice the projection component
+    mirrored_center = center - 2 * proj * axis
+
+    return Sphere(
+        center=jnp.asarray(mirrored_center),
+        radius=sphere.radius,
+    )
+
+
+def _partition_points_by_plane(
+    points: np.ndarray,
+    axis: np.ndarray,
+    centroid: np.ndarray,
+    tolerance: float,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """
+    Partition points into left, right, and near-plane sets.
+
+    Args:
+        points: (N, 3) array of points
+        axis: Unit normal of the symmetry plane
+        centroid: A point on the symmetry plane
+        tolerance: Points within this signed distance are "near plane"
+
+    Returns:
+        (left_points, right_points, near_plane_points)
+        - left: projection < -tolerance
+        - right: projection > tolerance
+        - near_plane: |projection| <= tolerance
+    """
+    # Signed distance from plane (positive = same side as axis)
+    projections = (points - centroid) @ axis
+
+    left_mask = projections < -tolerance
+    right_mask = projections > tolerance
+    near_mask = ~left_mask & ~right_mask
+
+    return points[left_mask], points[right_mask], points[near_mask]
+
+
 def spherize(
     mesh: trimesh.Trimesh,
     target_spheres: int,
@@ -287,40 +348,103 @@ def spherize(
         return result if result else [sphere]
 
     # Detect symmetry if enabled
-    symmetry_info = None
+    symmetry_axis = None
+    use_mirroring = False
+
     if p.symmetry_mode != "off":
-        axis, score = detect_reflection_symmetry(points, p.symmetry_tolerance)
-        if axis is not None or p.symmetry_mode == "force":
-            if axis is None:
+        symmetry_axis, _score = detect_reflection_symmetry(points, p.symmetry_tolerance)
+
+        # Reject longitudinal symmetry (plane cutting along the shape's length)
+        # For elongated shapes, we want transverse symmetry (plane perpendicular to length)
+        if symmetry_axis is not None:
+            # Get primary axis (PC1) - the direction of maximum variance (shape's length)
+            pca_check = PCA(n_components=1)
+            pca_check.fit(points - points.mean(axis=0))
+            primary_axis = pca_check.components_[0]
+
+            # Check alignment between symmetry axis and primary axis
+            # alignment ~= 1: symmetry axis parallel to primary axis (transverse plane) -> accept
+            # alignment ~= 0: symmetry axis perpendicular to primary axis (longitudinal plane) -> reject
+            alignment = abs(np.dot(symmetry_axis, primary_axis))
+            if alignment < 0.5:  # reject if angle > 60 degrees from primary axis
+                symmetry_axis = None
+
+        if symmetry_axis is not None or p.symmetry_mode == "force":
+            use_mirroring = True
+            if symmetry_axis is None:
                 # Force mode: use first PCA axis as default symmetry plane
                 pca = PCA(n_components=1)
                 pca.fit(points - points.mean(axis=0))
-                axis = pca.components_[0]
-                score = 0.0
+                symmetry_axis = pca.components_[0]
 
-            symmetry_info = {
-                "axis": axis,
-                "score": score,
-                "enforced": True,
-                "depth": 0,
-            }
+    if use_mirroring and symmetry_axis is not None:
+        # === TRUE SYMMETRIC MIRRORING ===
+        centroid = points.mean(axis=0)
 
-    # Handle center sphere for odd budgets with symmetry
-    center_sphere = None
-    effective_budget = target_spheres
+        # Compute plane tolerance based on bbox diagonal (2% of diagonal)
+        plane_tolerance = bbox_diag * 0.02
 
-    if symmetry_info is not None and p.odd_budget_mode == "center" and target_spheres % 2 == 1:
-        # Fit center sphere first, then split remaining budget
-        center_sphere = _fit_center_sphere(points, symmetry_info["axis"], padding, percentile)
-        effective_budget = target_spheres - 1
+        # Partition points into left, right, and near-plane
+        left_pts, right_pts, near_plane_pts = _partition_points_by_plane(
+            points, symmetry_axis, centroid, plane_tolerance
+        )
 
-    spheres = split(points, effective_budget, symmetry_info)
+        # Handle odd budgets based on mode
+        center_sphere = None
+        effective_budget = target_spheres
 
-    # Insert center sphere if we created one
-    if center_sphere is not None:
-        # Insert in the middle of the list
-        mid_idx = len(spheres) // 2
-        spheres.insert(mid_idx, center_sphere)
+        if target_spheres % 2 == 1:
+            if p.odd_budget_mode == "center":
+                # Fit center sphere to cover near-plane points
+                if len(near_plane_pts) > 0:
+                    center_sphere = _fit_center_sphere(
+                        near_plane_pts, symmetry_axis, padding, percentile
+                    )
+                else:
+                    # Fallback: fit to all points (original behavior)
+                    center_sphere = _fit_center_sphere(
+                        points, symmetry_axis, padding, percentile
+                    )
+                effective_budget = target_spheres - 1
+            else:  # "round_up"
+                # Round up to even for symmetric mirroring
+                effective_budget = target_spheres + 1
+
+        # Compute half budget
+        half_budget = effective_budget // 2
+
+        # Choose the larger half to spherize (for more samples)
+        if len(left_pts) >= len(right_pts):
+            primary_pts = left_pts
+        else:
+            primary_pts = right_pts
+            # Flip axis so mirroring goes the right direction
+            symmetry_axis = -symmetry_axis
+
+        # Spherize only the primary half (no symmetry_info - standard recursive split)
+        primary_spheres: list[Sphere] = []
+        if len(primary_pts) >= 10 and half_budget > 0:
+            primary_spheres = split(primary_pts, half_budget, symmetry_info=None)
+        elif len(primary_pts) > 0 and half_budget > 0:
+            s = fit_sphere_minmax(primary_pts, padding, percentile)
+            s = jdc.replace(s, radius=min(s.radius, max_radius))
+            primary_spheres = [s]
+
+        # Mirror spheres to create the other half
+        mirrored_spheres = [
+            _mirror_sphere(s, symmetry_axis, centroid) for s in primary_spheres
+        ]
+
+        # Combine: primary + mirrored + center
+        spheres = primary_spheres + mirrored_spheres
+        if center_sphere is not None:
+            # Insert center sphere in the middle
+            mid_idx = len(spheres) // 2
+            spheres.insert(mid_idx, center_sphere)
+
+    else:
+        # === ORIGINAL BEHAVIOR (symmetry_mode="off" or no symmetry detected) ===
+        spheres = split(points, target_spheres, symmetry_info=None)
 
     # Post-process: cap radius variance for more uniformity (may cause under-approximation)
     if uniform_radius and len(spheres) > 1:

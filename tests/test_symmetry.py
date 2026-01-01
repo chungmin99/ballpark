@@ -9,6 +9,8 @@ from ballpark._spherize import (
     detect_reflection_symmetry,
     spherize,
     _allocate_symmetric_budget,
+    _mirror_sphere,
+    _partition_points_by_plane,
 )
 from ballpark._config import SpherizeParams
 
@@ -132,32 +134,53 @@ class TestSymmetricSpherization:
     """Integration tests for symmetric spherization."""
 
     def test_symmetric_mesh_produces_symmetric_spheres(self):
-        """Symmetric mesh should produce mirror-symmetric sphere positions."""
+        """Symmetric mesh should produce EXACTLY mirror-symmetric sphere positions."""
         mesh = trimesh.creation.box(extents=[2, 1, 1])  # Elongated along X
         params = SpherizeParams(symmetry_mode="auto", symmetry_tolerance=0.05)
 
         spheres = spherize(mesh, target_spheres=8, params=params)
         centers = np.array([np.array(s.center) for s in spheres])
+        radii = np.array([float(s.radius) for s in spheres])
 
-        # Find the symmetry axis (should be one of the principal axes)
-        # For a box elongated along X, symmetry plane is YZ (normal is X)
-        # Check that centers come in symmetric pairs about X=0
+        # Detect the symmetry axis from sphere positions using PCA
+        # The first principal component should be along the symmetry direction
+        from sklearn.decomposition import PCA
+        pca = PCA(n_components=1)
+        pca.fit(centers)
+        symmetry_axis = pca.components_[0]
 
-        positive_x = centers[centers[:, 0] > 0.01]
-        negative_x = centers[centers[:, 0] < -0.01]
+        # Project centers onto symmetry axis
+        centroid = centers.mean(axis=0)
+        projections = (centers - centroid) @ symmetry_axis
 
-        # Should have roughly equal number on each side
-        assert abs(len(positive_x) - len(negative_x)) <= 1, (
-            f"Unequal distribution: {len(positive_x)} vs {len(negative_x)}"
+        # Separate into positive and negative sides
+        pos_mask = projections > 1e-6
+        neg_mask = projections < -1e-6
+
+        positive_spheres = [(centers[i], radii[i]) for i in range(len(centers)) if pos_mask[i]]
+        negative_spheres = [(centers[i], radii[i]) for i in range(len(centers)) if neg_mask[i]]
+
+        # Should have equal number on each side
+        assert len(positive_spheres) == len(negative_spheres), (
+            f"Unequal distribution: {len(positive_spheres)} vs {len(negative_spheres)}"
         )
 
-        # For each positive center, there should be a matching negative one
-        for pos_center in positive_x:
-            reflected = pos_center.copy()
-            reflected[0] = -reflected[0]
-            distances = np.linalg.norm(negative_x - reflected, axis=1)
-            min_dist = np.min(distances) if len(distances) > 0 else float("inf")
-            assert min_dist < 0.3, f"No symmetric pair found for {pos_center}"
+        # For each positive center, there should be an EXACT mirror on negative side
+        for pos_center, pos_radius in positive_spheres:
+            # Compute reflection across symmetry plane
+            offset = pos_center - centroid
+            proj = np.dot(offset, symmetry_axis)
+            reflected = pos_center - 2 * proj * symmetry_axis
+
+            # Find matching sphere (exact mirror with same radius)
+            found_match = False
+            for neg_center, neg_radius in negative_spheres:
+                dist = np.linalg.norm(neg_center - reflected)
+                if dist < 1e-4 and abs(neg_radius - pos_radius) < 1e-4:
+                    found_match = True
+                    break
+
+            assert found_match, f"No exact mirror found for {pos_center} (r={pos_radius})"
 
     def test_symmetry_mode_off(self):
         """With symmetry_mode='off', should use original algorithm."""
@@ -225,3 +248,182 @@ class TestSymmetricSpherization:
         for s in spheres:
             assert isinstance(s, Sphere)
             assert s.radius > 0
+
+    def test_mirroring_produces_identical_structure(self):
+        """Verify that mirrored spheres have identical structure to originals."""
+        mesh = trimesh.creation.box(extents=[4, 1, 1])  # Very elongated
+        params = SpherizeParams(
+            symmetry_mode="force",  # Force symmetry
+            odd_budget_mode="center",
+        )
+
+        # Odd budget to test center sphere
+        spheres = spherize(mesh, target_spheres=7, params=params)
+
+        centers = np.array([np.array(s.center) for s in spheres])
+        radii = np.array([float(s.radius) for s in spheres])
+
+        # With budget=7: 1 center + 3 left + 3 right = 7
+        # Center sphere should be at x ~= 0
+
+        center_mask = np.abs(centers[:, 0]) < 0.1
+        assert np.sum(center_mask) == 1, "Should have exactly one center sphere"
+
+        # Left and right should each have 3
+        left_mask = centers[:, 0] < -0.1
+        right_mask = centers[:, 0] > 0.1
+
+        assert np.sum(left_mask) == 3, f"Expected 3 left spheres, got {np.sum(left_mask)}"
+        assert np.sum(right_mask) == 3, f"Expected 3 right spheres, got {np.sum(right_mask)}"
+
+        # Radii on left and right should match exactly
+        left_radii = sorted(radii[left_mask])
+        right_radii = sorted(radii[right_mask])
+
+        np.testing.assert_allclose(
+            left_radii, right_radii, rtol=1e-5,
+            err_msg="Left and right sphere radii should match exactly"
+        )
+
+    def test_small_budget_with_symmetry(self):
+        """Test edge cases with very small budgets."""
+        mesh = trimesh.creation.box(extents=[2, 1, 1])
+
+        # Budget = 2: should get 1 left + 1 mirrored
+        params = SpherizeParams(symmetry_mode="force")
+        spheres = spherize(mesh, target_spheres=2, params=params)
+        assert len(spheres) >= 2
+
+        # Budget = 1 with center mode: should get just center sphere
+        params = SpherizeParams(symmetry_mode="force", odd_budget_mode="center")
+        spheres = spherize(mesh, target_spheres=1, params=params)
+        assert len(spheres) >= 1
+
+    def test_near_plane_points_coverage(self):
+        """Verify that points near the symmetry plane are covered."""
+        mesh = trimesh.creation.box(extents=[2, 2, 2])
+        params = SpherizeParams(
+            symmetry_mode="force",
+            odd_budget_mode="center",
+        )
+
+        spheres = spherize(mesh, target_spheres=5, params=params)
+
+        # Sample points near the symmetry plane (x ~= 0)
+        near_plane_points = np.array([
+            [0.0, y, z] for y in np.linspace(-0.9, 0.9, 5)
+            for z in np.linspace(-0.9, 0.9, 5)
+        ])
+
+        # Check that at least one sphere covers each point
+        centers = np.array([np.array(s.center) for s in spheres])
+        radii = np.array([float(s.radius) for s in spheres])
+
+        for pt in near_plane_points:
+            distances = np.linalg.norm(centers - pt, axis=1)
+            covered = np.any(distances <= radii * 1.1)  # 10% tolerance
+            assert covered, f"Point {pt} not covered by any sphere"
+
+
+class TestMirrorHelpers:
+    """Tests for the mirroring helper functions."""
+
+    def test_mirror_sphere_basic(self):
+        """Test basic sphere mirroring across a plane."""
+        import jax.numpy as jnp
+
+        # Sphere at (1, 0, 0), mirror across YZ plane (axis = [1, 0, 0])
+        sphere = Sphere(center=jnp.array([1.0, 0.5, 0.5]), radius=jnp.array(0.2))
+        axis = np.array([1.0, 0.0, 0.0])
+        centroid = np.array([0.0, 0.0, 0.0])
+
+        mirrored = _mirror_sphere(sphere, axis, centroid)
+
+        # Should be at (-1, 0.5, 0.5) with same radius
+        expected_center = np.array([-1.0, 0.5, 0.5])
+        np.testing.assert_allclose(np.array(mirrored.center), expected_center, atol=1e-6)
+        np.testing.assert_allclose(float(mirrored.radius), 0.2, atol=1e-6)
+
+    def test_mirror_sphere_off_center_plane(self):
+        """Test mirroring across a plane not at origin."""
+        import jax.numpy as jnp
+
+        # Sphere at (2, 0, 0), plane at x=1 with normal [1, 0, 0]
+        sphere = Sphere(center=jnp.array([2.0, 0.0, 0.0]), radius=jnp.array(0.5))
+        axis = np.array([1.0, 0.0, 0.0])
+        centroid = np.array([1.0, 0.0, 0.0])
+
+        mirrored = _mirror_sphere(sphere, axis, centroid)
+
+        # Distance from plane is 1, so mirrored should be at x = 1 - 1 = 0
+        expected_center = np.array([0.0, 0.0, 0.0])
+        np.testing.assert_allclose(np.array(mirrored.center), expected_center, atol=1e-6)
+
+    def test_partition_points_by_plane(self):
+        """Test point partitioning."""
+        # Create points on both sides of YZ plane (x=0)
+        points = np.array([
+            [-1.0, 0.0, 0.0],  # left
+            [-0.5, 0.0, 0.0],  # left
+            [0.0, 0.0, 0.0],   # near plane
+            [0.01, 0.0, 0.0],  # near plane (within tolerance)
+            [0.5, 0.0, 0.0],   # right
+            [1.0, 0.0, 0.0],   # right
+        ])
+        axis = np.array([1.0, 0.0, 0.0])
+        centroid = np.array([0.0, 0.0, 0.0])
+        tolerance = 0.05
+
+        left, right, near = _partition_points_by_plane(points, axis, centroid, tolerance)
+
+        assert len(left) == 2, f"Expected 2 left points, got {len(left)}"
+        assert len(right) == 2, f"Expected 2 right points, got {len(right)}"
+        assert len(near) == 2, f"Expected 2 near-plane points, got {len(near)}"
+
+
+class TestLongitudinalSymmetryRejection:
+    """Tests for rejection of longitudinal symmetry in elongated shapes."""
+
+    def test_cylinder_rejects_longitudinal_symmetry(self):
+        """Cylinder should NOT use symmetric mirroring (longitudinal symmetry rejected).
+
+        For an elongated cylinder, the detected symmetry plane would cut along the
+        length (longitudinal), causing side-by-side sphere pairs. This should be
+        rejected, resulting in spheres distributed along the cylinder's length.
+        """
+        mesh = trimesh.creation.cylinder(radius=0.5, height=3.0)  # Elongated cylinder
+        params = SpherizeParams(symmetry_mode="auto", symmetry_tolerance=0.05)
+
+        spheres = spherize(mesh, target_spheres=6, params=params)
+        centers = np.array([np.array(s.center) for s in spheres])
+
+        # The cylinder is aligned along Z axis (height=3.0)
+        # If longitudinal symmetry was used, spheres would be mirrored in X or Y
+        # If correctly rejected, spheres should be distributed along Z
+
+        # Check that spheres span a significant range along Z (the long axis)
+        z_range = centers[:, 2].max() - centers[:, 2].min()
+
+        # With 6 spheres along a height=3 cylinder, Z range should be substantial
+        # If mirroring was used incorrectly, Z range would be small (spheres stacked at same Z)
+        assert z_range > 1.0, (
+            f"Spheres should be distributed along cylinder length (Z), but Z range is only {z_range:.2f}. "
+            "This suggests longitudinal symmetry was incorrectly applied."
+        )
+
+    def test_elongated_box_distributes_along_length(self):
+        """Elongated box should have spheres distributed along its length."""
+        mesh = trimesh.creation.box(extents=[4, 1, 1])  # Elongated along X
+        params = SpherizeParams(symmetry_mode="auto", symmetry_tolerance=0.05)
+
+        spheres = spherize(mesh, target_spheres=6, params=params)
+        centers = np.array([np.array(s.center) for s in spheres])
+
+        # Check that spheres span a significant range along X (the long axis)
+        x_range = centers[:, 0].max() - centers[:, 0].min()
+
+        # With 6 spheres along a length=4 box, X range should be substantial
+        assert x_range > 1.5, (
+            f"Spheres should be distributed along box length (X), but X range is only {x_range:.2f}. "
+            "This suggests longitudinal symmetry was incorrectly applied."
+        )
