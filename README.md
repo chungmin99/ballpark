@@ -15,7 +15,7 @@ For robot URDFs, we also include:
 - Similar links are detected and share sphere parameters for visual and geometric consistency.
 - JSON export with sphere parameters for each link, and an ignore-list of link pairs for collision checking.
 
-We also include an interactive visualization and parameter adjusting GUI using [viser](https://viser.studio).
+We also include a set of interactive visualization tools, supported via [viser](https://viser.studio).
 
 
 ## Installation
@@ -69,6 +69,13 @@ result = robot.refine(result, config=config)
 for link_name, spheres in result.link_spheres.items():
     print(f"{link_name}: {len(spheres)} spheres")
 ```
+
+### Manual Sphere Adjustments
+
+We include an interactive script for adjusting the pose + radii of the auto-generated spheres. 
+
+https://github.com/user-attachments/assets/895bbf5f-e4db-47c2-8946-cb5f2dbbb9b9
+
 
 ## Acknowledgments
 
