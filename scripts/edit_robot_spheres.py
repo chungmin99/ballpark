@@ -110,7 +110,9 @@ class _EditorGui:
 
         # Build GUI
         with server.gui.add_folder("Editor"):
-            server.gui.add_text("File", initial_value=str(data_store.path), disabled=True)
+            server.gui.add_text(
+                "File", initial_value=str(data_store.path), disabled=True
+            )
             self._status_text = server.gui.add_text(
                 "Status", initial_value="Saved", disabled=True
             )
@@ -130,7 +132,9 @@ class _EditorGui:
                     self._on_deselect()
 
         with server.gui.add_folder("Visualization"):
-            self._show_spheres = server.gui.add_checkbox("Show Spheres", initial_value=True)
+            self._show_spheres = server.gui.add_checkbox(
+                "Show Spheres", initial_value=True
+            )
             self._opacity = server.gui.add_slider(
                 "Opacity", min=0.1, max=1.0, step=0.1, initial_value=0.7
             )
@@ -324,9 +328,7 @@ class _EditableSphereVisuals:
                 # Register click handler
                 self._register_click_handler(key, handle)
 
-    def _register_click_handler(
-        self, key: str, handle: viser.IcosphereHandle
-    ) -> None:
+    def _register_click_handler(self, key: str, handle: viser.IcosphereHandle) -> None:
         """Register click handler for a sphere."""
 
         @handle.on_click
@@ -378,14 +380,12 @@ class _EditableSphereVisuals:
                 position=tuple(world_center),
                 wxyz=(1, 0, 0, 0),
                 scale=0.2,
-                disable_rotations=True,
-                disable_sliders=True,
                 depth_test=False,
             )
 
             # Register update callback
             @self._transform_control.on_update
-            def _(_: viser.TransformControlsHandle) -> None:
+            def _(_) -> None:
                 self._on_transform_update()
 
         # Notify callback
@@ -568,7 +568,9 @@ def main(
     # Load sphere data
     print(f"Loading spheres from {json_path}...")
     data_store = SphereDataStore(json_path)
-    print(f"Loaded {data_store.num_spheres} spheres across {len(data_store.data)} links")
+    print(
+        f"Loaded {data_store.num_spheres} spheres across {len(data_store.data)} links"
+    )
 
     # Load robot
     print(f"Loading robot: {robot_name}...")
