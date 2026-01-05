@@ -17,11 +17,6 @@ For robot URDFs, we also include:
 
 We also include a set of interactive visualization tools, supported via [viser](https://viser.studio).
 
-The auto-generated spheres can be manually adjusted by the user:
-
-https://github.com/user-attachments/assets/895bbf5f-e4db-47c2-8946-cb5f2dbbb9b9
-
-
 
 ## Installation
 
@@ -74,6 +69,13 @@ result = robot.refine(result, config=config)
 for link_name, spheres in result.link_spheres.items():
     print(f"{link_name}: {len(spheres)} spheres")
 ```
+
+### Manual Sphere Adjustments
+
+We include an interactive script for adjusting the pose + radii of the auto-generated spheres. 
+
+https://github.com/user-attachments/assets/895bbf5f-e4db-47c2-8946-cb5f2dbbb9b9
+
 
 ## Acknowledgments
 
