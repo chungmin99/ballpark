@@ -82,6 +82,9 @@ class Robot:
         # Compute non-contiguous pairs for self-collision checking
         self._non_contiguous_pairs = self._get_non_contiguous_link_pairs(self._links)
 
+        # Cached mesh distances for self-collision filtering (computed lazily)
+        self._cached_mesh_distances: dict[tuple[str, str], float] | None = None
+
         # Compute similarity using cached data
         self._similarity = detect_similar_links(
             self._link_meshes, self._link_fingerprints
@@ -111,6 +114,40 @@ class Robot:
     def joint_limits(self) -> tuple[np.ndarray, np.ndarray]:
         """Joint limits as (lower, upper) arrays."""
         return self._get_joint_limits()
+
+    @property
+    def non_contiguous_pairs(self) -> list[tuple[str, str]]:
+        """Link pairs that are not adjacent in the kinematic chain."""
+        return self._non_contiguous_pairs
+
+    def get_mesh_distances(
+        self, joint_cfg: np.ndarray | None = None
+    ) -> dict[tuple[str, str], float]:
+        """
+        Get mesh distances between non-contiguous link pairs.
+
+        Args:
+            joint_cfg: Joint configuration for FK. If None, uses middle of limits
+                and returns cached values.
+
+        Returns:
+            Dict mapping (link_a, link_b) to minimum mesh distance.
+        """
+        if joint_cfg is None:
+            return self._get_mesh_distances()
+        # Compute for specific config (not cached)
+        from ballpark.utils._mesh_utils import compute_mesh_distances_batch
+
+        return compute_mesh_distances_batch(
+            self._link_meshes,
+            self._non_contiguous_pairs,
+            self._all_link_names,
+            self.joint_limits,
+            self.compute_transforms,
+            n_samples=1000,
+            bbox_skip_threshold=0.1,
+            joint_cfg=joint_cfg,
+        )
 
     def compute_transforms(self, cfg: np.ndarray) -> np.ndarray:
         """
@@ -190,6 +227,29 @@ class Robot:
                 if tuple(sorted([link_a, link_b])) not in adjacent:
                     pairs.append((link_a, link_b))
         return pairs
+
+    def _get_mesh_distances(self) -> dict[tuple[str, str], float]:
+        """Get cached mesh distances for non-contiguous link pairs.
+
+        Computed lazily on first call using FK at middle of joint limits.
+        """
+        if self._cached_mesh_distances is None:
+            from .utils._mesh_utils import compute_mesh_distances_batch
+
+            lower, upper = self.joint_limits
+            q_mid = (lower + upper) / 2
+
+            self._cached_mesh_distances = compute_mesh_distances_batch(
+                self._link_meshes,
+                self._non_contiguous_pairs,
+                self._all_link_names,
+                self.joint_limits,
+                self.compute_transforms,
+                n_samples=1000,
+                bbox_skip_threshold=0.1,
+                joint_cfg=q_mid,
+            )
+        return self._cached_mesh_distances
 
     def _get_collision_mesh_for_link(self, link_name: str) -> trimesh.Trimesh:
         """Extract collision mesh for a given link from URDF."""
@@ -403,6 +463,8 @@ class Robot:
         self,
         spheres_result: RobotSpheresResult,
         config: BallparkConfig | None = None,
+        joint_cfg: np.ndarray | None = None,
+        excluded_pairs: set[tuple[str, str]] | None = None,
     ) -> RobotSpheresResult:
         """
         Refine sphere parameters using gradient-based optimization.
@@ -414,6 +476,9 @@ class Robot:
         Args:
             spheres_result: Result from robot.spherize()
             config: Configuration for refinement. If None, uses BALANCED preset.
+            joint_cfg: Joint configuration for FK and mesh distances. If None,
+                uses middle of joint limits with cached mesh distances.
+            excluded_pairs: Link pairs to skip for collision checking.
 
         Returns:
             RobotSpheresResult with refined spheres
@@ -424,7 +489,12 @@ class Robot:
             spheres_result.link_spheres,
             self._link_meshes,
             self._all_link_names,
+            self.joint_limits,
+            self.compute_transforms,
+            self._non_contiguous_pairs,
             refine_params=cfg.refine,
+            joint_cfg=joint_cfg,
+            excluded_pairs=excluded_pairs,
         )
         return RobotSpheresResult(link_spheres=refined_link_spheres)
 

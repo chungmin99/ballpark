@@ -77,8 +77,8 @@ def main(
     while True:
         gui.poll()
 
-        # Recompute spheres when allocation settings change
-        if gui.needs_recompute:
+        # Re-spherize only when allocation or spherize params changed
+        if gui.needs_spherize:
             # Two allocation modes:
             # - Auto: robot.auto_allocate() distributes spheres by link complexity
             # - Manual: user specifies per-link counts (similar links stay synced)
@@ -99,19 +99,35 @@ def main(
                 result = robot.spherize(allocation=allocation, config=config)
                 elapsed = (time.perf_counter() - t0) * 1000
                 print(f"Generated {result.num_spheres} spheres in {elapsed:.1f}ms")
-
-                # Optionally refine spheres
-                if gui.refine_enabled:
-                    t0 = time.perf_counter()
-                    result = robot.refine(result, config=config)
-                    elapsed = (time.perf_counter() - t0) * 1000
-                    print(f"Refined spheres in {elapsed:.1f}ms")
             else:
                 result = RobotSpheresResult(link_spheres={})
 
-            sphere_visuals.update(result, gui.opacity, gui.show_spheres)
             gui.update_sphere_count(result.num_spheres)
-            gui.mark_computed()
+            gui.mark_spherized()
+            gui.set_needs_refine_update()  # Trigger refine after spherize
+
+            # Compute mesh distances for the collision pair UI
+            mesh_distances = robot.get_mesh_distances(joint_cfg=gui.joint_config)
+            gui.update_mesh_distances(mesh_distances)
+
+        # Re-refine when refine settings changed OR after new spherize
+        if gui.needs_refine_update and result is not None:
+            config = gui.get_config()
+            if gui.refine_enabled and result.num_spheres > 0:
+                t0 = time.perf_counter()
+                refined = robot.refine(
+                    result,
+                    config=config,
+                    joint_cfg=gui.joint_config,
+                    excluded_pairs=gui.excluded_collision_pairs,
+                )
+                elapsed = (time.perf_counter() - t0) * 1000
+                print(f"Refined spheres in {elapsed:.1f}ms")
+                sphere_visuals.update(refined, gui.opacity, gui.show_spheres)
+            else:
+                sphere_visuals.update(result, gui.opacity, gui.show_spheres)
+
+            gui.mark_refine_updated()
             gui.mark_visuals_updated()
 
         # Update sphere visuals if only appearance changed (opacity, visibility)
@@ -153,8 +169,15 @@ class _SpheresGui:
         self._last_refine: bool = False
         self._last_preset: str = "Balanced"
         self._last_params: dict[str, float] = {}
-        self._needs_recompute = True
+        self._last_joint_config: np.ndarray | None = None  # Track joint config changes
+        self._needs_spherize = True  # Allocation or spherize params changed
+        self._needs_refine_update = True  # Refine toggle or refine params changed
         self._needs_visual_update = True
+
+        # Collision pair tracking
+        self._mesh_distances: dict[tuple[str, str], float] = {}
+        self._skipped_pairs: set[tuple[str, str]] = set()  # User-confirmed skips
+        self._pending_suggestions: list[tuple[str, str]] = []
 
         # Current config (updated by presets or custom sliders)
         self._current_config = BallparkConfig.from_preset(SpherePreset.BALANCED)
@@ -225,6 +248,23 @@ class _SpheresGui:
                     if self._export_callback:
                         self._export_callback()
 
+            # Collision Pairs folder
+            with server.gui.add_folder("Collision Pairs", expand_by_default=False):
+                self._collision_info = server.gui.add_markdown(
+                    "*Computing mesh distances...*"
+                )
+                self._suggest_button = server.gui.add_button("Review ambiguous pairs")
+                self._apply_button = server.gui.add_button("Skip these pairs")
+                self._apply_button.visible = False
+
+                @self._suggest_button.on_click
+                def _suggest_handler(_: viser.GuiEvent) -> None:
+                    self._suggest_pairs_to_skip()
+
+                @self._apply_button.on_click
+                def _apply_handler(_: viser.GuiEvent) -> None:
+                    self._apply_suggestions()
+
         # Joints tab
         lower, upper = robot.joint_limits
         self._joint_sliders = []
@@ -241,32 +281,50 @@ class _SpheresGui:
 
     def poll(self) -> None:
         """Check for GUI changes and update internal state."""
-        # Preset change
+        # Preset change - affects both spherize and refine params
         if self._preset.value != self._last_preset:
             self._last_preset = self._preset.value
             self._apply_preset(self._preset.value)
-            self._needs_recompute = True
+            self._needs_spherize = True
+            self._needs_refine_update = True
 
         # Custom params change (only in Custom mode)
         if self._preset.value == "Custom" and self._params_sliders:
             current_params = self._get_params_values()
             if current_params != self._last_params:
-                self._last_params = current_params
-                self._needs_recompute = True
+                # Check which params changed
+                spherize_params = {
+                    "padding", "target_tightness", "aspect_threshold",
+                    "percentile", "max_radius_ratio", "uniform_radius",
+                    "axis_mode", "symmetry_mode", "symmetry_tolerance",
+                }
+                refine_params = {
+                    "n_iters", "tol", "lambda_under", "lambda_over",
+                    "lambda_center_reg", "lambda_radius_reg", "lambda_self_collision",
+                }
 
-        # Mode change
+                for key in current_params:
+                    if current_params[key] != self._last_params.get(key):
+                        if key in spherize_params:
+                            self._needs_spherize = True
+                        if key in refine_params:
+                            self._needs_refine_update = True
+
+                self._last_params = current_params
+
+        # Mode change - affects allocation
         if self._mode.value != self._last_mode:
             self._last_mode = self._mode.value
             is_manual = self._last_mode == "Manual"
             for slider in self._link_sliders.values():
                 slider.disabled = not is_manual
             self._total_spheres.disabled = is_manual
-            self._needs_recompute = True
+            self._needs_spherize = True
 
         # Total spheres change (auto mode)
         if self._mode.value == "Auto" and self._total_spheres.value != self._last_total:
             self._last_total = int(self._total_spheres.value)
-            self._needs_recompute = True
+            self._needs_spherize = True
 
         # Per-link slider change (manual mode)
         if self._mode.value == "Manual":
@@ -284,12 +342,12 @@ class _SpheresGui:
                 current = {name: int(s.value) for name, s in self._link_sliders.items()}
                 self._total_spheres.value = sum(current.values())
                 self._last_link_budgets = current
-                self._needs_recompute = True
+                self._needs_spherize = True
 
-        # Refine checkbox change
+        # Refine checkbox change - ONLY affects refine, not spherize
         if self._refine.value != self._last_refine:
             self._last_refine = self._refine.value
-            self._needs_recompute = True
+            self._needs_refine_update = True  # NOT _needs_spherize
 
         # Visibility/opacity change
         if (
@@ -299,6 +357,14 @@ class _SpheresGui:
             self._last_show = self._show_spheres.value
             self._last_opacity = self._opacity.value
             self._needs_visual_update = True
+
+        # Joint config change - triggers re-refine (mesh distances depend on config)
+        current_joint_config = self.joint_config
+        if self._last_joint_config is None or not np.allclose(
+            current_joint_config, self._last_joint_config, atol=1e-4
+        ):
+            self._last_joint_config = current_joint_config.copy()
+            self._needs_refine_update = True
 
     def _get_group_for_link(self, link_name: str) -> list[str] | None:
         for group in self._robot._similarity.groups:
@@ -427,6 +493,15 @@ class _SpheresGui:
                     step=0.1,
                     initial_value=cfg.refine.lambda_radius_reg,
                 )
+                self._params_sliders["lambda_self_collision"] = (
+                    self._server.gui.add_slider(
+                        "lambda_self_collision",
+                        min=0.0,
+                        max=10.0,
+                        step=0.1,
+                        initial_value=cfg.refine.lambda_self_collision,
+                    )
+                )
 
         # Cache initial values
         self._last_params = self._get_params_values()
@@ -486,6 +561,7 @@ class _SpheresGui:
                 lambda_over=float(p["lambda_over"].value),
                 lambda_center_reg=float(p["lambda_center_reg"].value),
                 lambda_radius_reg=float(p["lambda_radius_reg"].value),
+                lambda_self_collision=float(p["lambda_self_collision"].value),
             ),
         )
 
@@ -508,12 +584,85 @@ class _SpheresGui:
             slider.value = alloc.get(name, 0)
         self._last_link_budgets = alloc
 
-    @property
-    def needs_recompute(self) -> bool:
-        return self._needs_recompute
+    def update_mesh_distances(self, distances: dict[tuple[str, str], float]) -> None:
+        """Update the collision pair info with mesh distances."""
+        self._mesh_distances = distances
 
-    def mark_computed(self) -> None:
-        self._needs_recompute = False
+        # Count user-skipped pairs
+        skipped_count = sum(
+            1 for p in distances
+            if p in self._skipped_pairs or (p[1], p[0]) in self._skipped_pairs
+        )
+        checking_count = len(distances) - skipped_count
+
+        lines = [
+            f"**{checking_count}** pairs (checking)",
+            f"**{skipped_count}** pairs (user-skipped)",
+        ]
+        self._collision_info.content = "\n".join(lines)
+
+    def _suggest_pairs_to_skip(self) -> None:
+        """Show pairs available for user review."""
+        if not self._mesh_distances:
+            self._collision_info.content = "*No mesh distances computed yet*"
+            return
+
+        # Find pairs not already skipped
+        available = [
+            (p, d) for p, d in self._mesh_distances.items()
+            if p not in self._skipped_pairs
+            and (p[1], p[0]) not in self._skipped_pairs
+        ]
+
+        if not available:
+            self.update_mesh_distances(self._mesh_distances)
+            self._collision_info.content += "\n\n*No pairs to review*"
+            self._apply_button.visible = False
+            return
+
+        # Show them for review
+        self._pending_suggestions = [p for p, _ in available]
+        self._apply_button.visible = True
+
+        lines = [f"\n**{len(available)} pairs available to skip:**"]
+        for (a, b), d in sorted(available, key=lambda x: x[1]):
+            lines.append(f"- {a} ↔ {b}: {d:.3f}m")
+        lines.append("\n*Click 'Skip these pairs' to stop checking them*")
+        self._collision_info.content += "\n".join(lines)
+
+    def _apply_suggestions(self) -> None:
+        """Add suggested pairs to the skip list."""
+        for pair in self._pending_suggestions:
+            self._skipped_pairs.add(pair)
+
+        self._pending_suggestions = []
+        self._apply_button.visible = False
+        self._needs_refine_update = True
+
+        # Update display
+        self.update_mesh_distances(self._mesh_distances)
+
+    @property
+    def excluded_collision_pairs(self) -> set[tuple[str, str]]:
+        """Return user-skipped pairs."""
+        return self._skipped_pairs.copy()
+
+    @property
+    def needs_spherize(self) -> bool:
+        return self._needs_spherize
+
+    def mark_spherized(self) -> None:
+        self._needs_spherize = False
+
+    @property
+    def needs_refine_update(self) -> bool:
+        return self._needs_refine_update
+
+    def set_needs_refine_update(self) -> None:
+        self._needs_refine_update = True
+
+    def mark_refine_updated(self) -> None:
+        self._needs_refine_update = False
 
     @property
     def needs_visual_update(self) -> bool:

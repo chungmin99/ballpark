@@ -117,9 +117,6 @@ class RefineParams:
     lambda_similarity: float = 1.0
     """Weight for similar link correspondence."""
 
-    mesh_collision_tolerance: float = 0.01
-    """Skip link pairs with mesh distance below this."""
-
 
 @jdc.pytree_dataclass
 class BallparkConfig:
