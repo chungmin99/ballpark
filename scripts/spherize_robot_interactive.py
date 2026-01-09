@@ -322,27 +322,43 @@ class _SpheresGui:
             # Spherize parameters
             with self._server.gui.add_folder("Spherize"):
                 self._params_sliders["padding"] = self._server.gui.add_slider(
-                    "padding", min=1.0, max=1.2, step=0.01,
+                    "padding",
+                    min=1.0,
+                    max=1.2,
+                    step=0.01,
                     initial_value=cfg.spherize.padding,
                 )
                 self._params_sliders["target_tightness"] = self._server.gui.add_slider(
-                    "target_tightness", min=1.0, max=2.0, step=0.05,
+                    "target_tightness",
+                    min=1.0,
+                    max=2.0,
+                    step=0.05,
                     initial_value=cfg.spherize.target_tightness,
                 )
                 self._params_sliders["aspect_threshold"] = self._server.gui.add_slider(
-                    "aspect_threshold", min=1.0, max=2.0, step=0.05,
+                    "aspect_threshold",
+                    min=1.0,
+                    max=2.0,
+                    step=0.05,
                     initial_value=cfg.spherize.aspect_threshold,
                 )
                 self._params_sliders["percentile"] = self._server.gui.add_slider(
-                    "percentile", min=90.0, max=100.0, step=0.5,
+                    "percentile",
+                    min=90.0,
+                    max=100.0,
+                    step=0.5,
                     initial_value=cfg.spherize.percentile,
                 )
                 self._params_sliders["max_radius_ratio"] = self._server.gui.add_slider(
-                    "max_radius_ratio", min=0.2, max=0.8, step=0.05,
+                    "max_radius_ratio",
+                    min=0.2,
+                    max=0.8,
+                    step=0.05,
                     initial_value=cfg.spherize.max_radius_ratio,
                 )
                 self._params_sliders["uniform_radius"] = self._server.gui.add_checkbox(
-                    "uniform_radius", initial_value=cfg.spherize.uniform_radius,
+                    "uniform_radius",
+                    initial_value=cfg.spherize.uniform_radius,
                 )
                 self._params_sliders["axis_mode"] = self._server.gui.add_dropdown(
                     "axis_mode",
@@ -354,70 +370,62 @@ class _SpheresGui:
                     options=["auto", "off", "force"],
                     initial_value=cfg.spherize.symmetry_mode,
                 )
-                self._params_sliders["symmetry_tolerance"] = self._server.gui.add_slider(
-                    "symmetry_tolerance", min=0.01, max=0.2, step=0.01,
-                    initial_value=cfg.spherize.symmetry_tolerance,
+                self._params_sliders["symmetry_tolerance"] = (
+                    self._server.gui.add_slider(
+                        "symmetry_tolerance",
+                        min=0.01,
+                        max=0.2,
+                        step=0.01,
+                        initial_value=cfg.spherize.symmetry_tolerance,
+                    )
                 )
 
             # Refine optimization parameters
             with self._server.gui.add_folder("Optimization"):
-                self._params_sliders["lr"] = self._server.gui.add_slider(
-                    "lr", min=0.0001, max=0.01, step=0.0001,
-                    initial_value=cfg.refine.lr,
-                )
                 self._params_sliders["n_iters"] = self._server.gui.add_slider(
-                    "n_iters", min=10, max=500, step=10,
+                    "n_iters",
+                    min=10,
+                    max=500,
+                    step=10,
                     initial_value=cfg.refine.n_iters,
                 )
                 self._params_sliders["tol"] = self._server.gui.add_slider(
-                    "tol", min=1e-6, max=1e-2, step=1e-5,
+                    "tol",
+                    min=1e-6,
+                    max=1e-2,
+                    step=1e-5,
                     initial_value=cfg.refine.tol,
                 )
 
-            # Per-link loss weights
-            with self._server.gui.add_folder("Per-Link Losses"):
+            # Loss weights (only those implemented in _refine.py)
+            with self._server.gui.add_folder("Losses"):
                 self._params_sliders["lambda_under"] = self._server.gui.add_slider(
-                    "lambda_under", min=0.0, max=5.0, step=0.1,
+                    "lambda_under",
+                    min=0.0,
+                    max=5.0,
+                    step=0.1,
                     initial_value=cfg.refine.lambda_under,
                 )
                 self._params_sliders["lambda_over"] = self._server.gui.add_slider(
-                    "lambda_over", min=0.0, max=0.1, step=0.001,
+                    "lambda_over",
+                    min=0.0,
+                    max=0.1,
+                    step=0.001,
                     initial_value=cfg.refine.lambda_over,
                 )
-                self._params_sliders["lambda_overlap"] = self._server.gui.add_slider(
-                    "lambda_overlap", min=0.0, max=0.5, step=0.01,
-                    initial_value=cfg.refine.lambda_overlap,
-                )
-                self._params_sliders["lambda_uniform"] = self._server.gui.add_slider(
-                    "lambda_uniform", min=0.0, max=1.0, step=0.05,
-                    initial_value=cfg.refine.lambda_uniform,
-                )
-                self._params_sliders["lambda_surface"] = self._server.gui.add_slider(
-                    "lambda_surface", min=0.0, max=1.0, step=0.05,
-                    initial_value=cfg.refine.lambda_surface,
-                )
-                self._params_sliders["lambda_sqem"] = self._server.gui.add_slider(
-                    "lambda_sqem", min=0.0, max=1.0, step=0.05,
-                    initial_value=cfg.refine.lambda_sqem,
-                )
-
-            # Robot-level loss weights
-            with self._server.gui.add_folder("Robot-Level Losses"):
-                self._params_sliders["lambda_self_collision"] = self._server.gui.add_slider(
-                    "lambda_self_collision", min=0.0, max=10.0, step=0.1,
-                    initial_value=cfg.refine.lambda_self_collision,
-                )
                 self._params_sliders["lambda_center_reg"] = self._server.gui.add_slider(
-                    "lambda_center_reg", min=0.0, max=10.0, step=0.1,
+                    "lambda_center_reg",
+                    min=0.0,
+                    max=10.0,
+                    step=0.1,
                     initial_value=cfg.refine.lambda_center_reg,
                 )
-                self._params_sliders["lambda_similarity"] = self._server.gui.add_slider(
-                    "lambda_similarity", min=0.0, max=10.0, step=0.1,
-                    initial_value=cfg.refine.lambda_similarity,
-                )
-                self._params_sliders["mesh_collision_tolerance"] = self._server.gui.add_slider(
-                    "mesh_collision_tol", min=0.0, max=0.05, step=0.001,
-                    initial_value=cfg.refine.mesh_collision_tolerance,
+                self._params_sliders["lambda_radius_reg"] = self._server.gui.add_slider(
+                    "lambda_radius_reg",
+                    min=0.0,
+                    max=10.0,
+                    step=0.1,
+                    initial_value=cfg.refine.lambda_radius_reg,
                 )
 
         # Cache initial values
@@ -472,19 +480,12 @@ class _SpheresGui:
                 symmetry_tolerance=float(p["symmetry_tolerance"].value),
             ),
             refine=RefineParams(
-                lr=float(p["lr"].value),
                 n_iters=int(p["n_iters"].value),
                 tol=float(p["tol"].value),
                 lambda_under=float(p["lambda_under"].value),
                 lambda_over=float(p["lambda_over"].value),
-                lambda_overlap=float(p["lambda_overlap"].value),
-                lambda_uniform=float(p["lambda_uniform"].value),
-                lambda_surface=float(p["lambda_surface"].value),
-                lambda_sqem=float(p["lambda_sqem"].value),
-                lambda_self_collision=float(p["lambda_self_collision"].value),
                 lambda_center_reg=float(p["lambda_center_reg"].value),
-                lambda_similarity=float(p["lambda_similarity"].value),
-                mesh_collision_tolerance=float(p["mesh_collision_tolerance"].value),
+                lambda_radius_reg=float(p["lambda_radius_reg"].value),
             ),
         )
 

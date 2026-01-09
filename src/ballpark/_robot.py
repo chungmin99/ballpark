@@ -5,6 +5,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from pathlib import Path
 
+import jaxlie
 import numpy as np
 import trimesh
 from scipy.spatial.transform import Rotation
@@ -14,7 +15,7 @@ from loguru import logger
 from ._config import BallparkConfig, SpherePreset, SpherizeParams
 from ._spherize import Sphere, spherize
 from ._similarity import SimilarityResult, detect_similar_links
-from ._refine import refine_robot_spheres, compute_min_self_collision_distance
+from ._refine import refine_robot_spheres
 from .utils._hash_geometry import get_link_collision_fingerprint
 
 
@@ -423,10 +424,6 @@ class Robot:
             spheres_result.link_spheres,
             self._link_meshes,
             self._all_link_names,
-            self.joint_limits,
-            self.compute_transforms,
-            self._non_contiguous_pairs,
-            self._similarity,
             refine_params=cfg.refine,
         )
         return RobotSpheresResult(link_spheres=refined_link_spheres)
@@ -449,14 +446,55 @@ class Robot:
         Returns:
             Minimum signed distance. Negative = collision, positive = clearance.
         """
-        return compute_min_self_collision_distance(
-            spheres_result.link_spheres,
-            self._all_link_names,
-            self.joint_limits,
-            self.compute_transforms,
-            self._non_contiguous_pairs,
-            joint_cfg=joint_cfg,
-        )
+        link_spheres = spheres_result.link_spheres
+        links_with_spheres = [
+            name for name in self._all_link_names if link_spheres.get(name)
+        ]
+        if not links_with_spheres:
+            return float("inf")
+
+        link_name_to_idx = {
+            name: idx for idx, name in enumerate(self._all_link_names)
+        }
+
+        if joint_cfg is None:
+            lower, upper = self.joint_limits
+            joint_cfg = (lower + upper) / 2
+        Ts = self.compute_transforms(joint_cfg)
+
+        min_dist = float("inf")
+
+        for link_a, link_b in self._non_contiguous_pairs:
+            spheres_a = link_spheres.get(link_a, [])
+            spheres_b = link_spheres.get(link_b, [])
+
+            if not spheres_a or not spheres_b:
+                continue
+
+            idx_a = link_name_to_idx[link_a]
+            idx_b = link_name_to_idx[link_b]
+
+            T_a = Ts[idx_a]
+            T_b = Ts[idx_b]
+
+            wxyz_a, xyz_a = T_a[:4], T_a[4:]
+            wxyz_b, xyz_b = T_b[:4], T_b[4:]
+
+            so3_a = jaxlie.SO3(wxyz=wxyz_a)
+            so3_b = jaxlie.SO3(wxyz=wxyz_b)
+
+            for sphere_i in spheres_a:
+                center_i_world = np.array(so3_a @ sphere_i.center) + xyz_a
+
+                for sphere_j in spheres_b:
+                    center_j_world = np.array(so3_b @ sphere_j.center) + xyz_b
+
+                    dist = np.linalg.norm(center_i_world - center_j_world)
+                    signed_dist = float(dist - (sphere_i.radius + sphere_j.radius))
+
+                    min_dist = min(min_dist, signed_dist)
+
+        return min_dist
 
 
 def _allocate_spheres_for_robot(

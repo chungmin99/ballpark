@@ -70,14 +70,11 @@ class SpherizeParams:
 
 @jdc.pytree_dataclass
 class RefineParams:
-    """Parameters for gradient-based refinement."""
+    """Parameters for jaxls nonlinear least squares refinement."""
 
     # Optimization params
     n_iters: int = 100
     """Maximum number of optimization iterations."""
-
-    lr: float = 1e-3
-    """Learning rate for Adam optimizer."""
 
     tol: float = 1e-4
     """Relative convergence tolerance for early stopping."""
@@ -111,8 +108,11 @@ class RefineParams:
     lambda_self_collision: float = 1.0
     """Weight for inter-link self-collision penalty."""
 
-    lambda_center_reg: float = 1.0
-    """Weight for center drift regularization."""
+    lambda_center_reg: float = 0.1
+    """Weight for center drift regularization (penalizes deviation from initial positions)."""
+
+    lambda_radius_reg: float = 0.1
+    """Weight for radius regularization (penalizes deviation from initial radii)."""
 
     lambda_similarity: float = 1.0
     """Weight for similar link correspondence."""
