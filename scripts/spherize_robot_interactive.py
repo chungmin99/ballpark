@@ -248,23 +248,6 @@ class _SpheresGui:
                     if self._export_callback:
                         self._export_callback()
 
-            # Collision Pairs folder
-            with server.gui.add_folder("Collision Pairs", expand_by_default=False):
-                self._collision_info = server.gui.add_markdown(
-                    "*Computing mesh distances...*"
-                )
-                self._suggest_button = server.gui.add_button("Review ambiguous pairs")
-                self._apply_button = server.gui.add_button("Skip these pairs")
-                self._apply_button.visible = False
-
-                @self._suggest_button.on_click
-                def _suggest_handler(_: viser.GuiEvent) -> None:
-                    self._suggest_pairs_to_skip()
-
-                @self._apply_button.on_click
-                def _apply_handler(_: viser.GuiEvent) -> None:
-                    self._apply_suggestions()
-
         # Joints tab
         lower, upper = robot.joint_limits
         self._joint_sliders = []
@@ -294,13 +277,24 @@ class _SpheresGui:
             if current_params != self._last_params:
                 # Check which params changed
                 spherize_params = {
-                    "padding", "target_tightness", "aspect_threshold",
-                    "percentile", "max_radius_ratio", "uniform_radius",
-                    "axis_mode", "symmetry_mode", "symmetry_tolerance",
+                    "padding",
+                    "target_tightness",
+                    "aspect_threshold",
+                    "percentile",
+                    "max_radius_ratio",
+                    "uniform_radius",
+                    "axis_mode",
+                    "symmetry_mode",
+                    "symmetry_tolerance",
                 }
                 refine_params = {
-                    "n_iters", "tol", "lambda_under", "lambda_over",
-                    "lambda_center_reg", "lambda_radius_reg", "lambda_self_collision",
+                    "n_iters",
+                    "tol",
+                    "lambda_under",
+                    "lambda_over",
+                    "lambda_center_reg",
+                    "lambda_radius_reg",
+                    "lambda_self_collision",
                 }
 
                 for key in current_params:
@@ -469,7 +463,7 @@ class _SpheresGui:
                     "lambda_under",
                     min=0.0,
                     max=5.0,
-                    step=0.1,
+                    step=0.001,
                     initial_value=cfg.refine.lambda_under,
                 )
                 self._params_sliders["lambda_over"] = self._server.gui.add_slider(
@@ -483,14 +477,14 @@ class _SpheresGui:
                     "lambda_center_reg",
                     min=0.0,
                     max=10.0,
-                    step=0.1,
+                    step=0.001,
                     initial_value=cfg.refine.lambda_center_reg,
                 )
                 self._params_sliders["lambda_radius_reg"] = self._server.gui.add_slider(
                     "lambda_radius_reg",
                     min=0.0,
                     max=10.0,
-                    step=0.1,
+                    step=0.001,
                     initial_value=cfg.refine.lambda_radius_reg,
                 )
                 self._params_sliders["lambda_self_collision"] = (
@@ -498,7 +492,7 @@ class _SpheresGui:
                         "lambda_self_collision",
                         min=0.0,
                         max=10.0,
-                        step=0.1,
+                        step=0.001,
                         initial_value=cfg.refine.lambda_self_collision,
                     )
                 )
@@ -587,60 +581,6 @@ class _SpheresGui:
     def update_mesh_distances(self, distances: dict[tuple[str, str], float]) -> None:
         """Update the collision pair info with mesh distances."""
         self._mesh_distances = distances
-
-        # Count user-skipped pairs
-        skipped_count = sum(
-            1 for p in distances
-            if p in self._skipped_pairs or (p[1], p[0]) in self._skipped_pairs
-        )
-        checking_count = len(distances) - skipped_count
-
-        lines = [
-            f"**{checking_count}** pairs (checking)",
-            f"**{skipped_count}** pairs (user-skipped)",
-        ]
-        self._collision_info.content = "\n".join(lines)
-
-    def _suggest_pairs_to_skip(self) -> None:
-        """Show pairs available for user review."""
-        if not self._mesh_distances:
-            self._collision_info.content = "*No mesh distances computed yet*"
-            return
-
-        # Find pairs not already skipped
-        available = [
-            (p, d) for p, d in self._mesh_distances.items()
-            if p not in self._skipped_pairs
-            and (p[1], p[0]) not in self._skipped_pairs
-        ]
-
-        if not available:
-            self.update_mesh_distances(self._mesh_distances)
-            self._collision_info.content += "\n\n*No pairs to review*"
-            self._apply_button.visible = False
-            return
-
-        # Show them for review
-        self._pending_suggestions = [p for p, _ in available]
-        self._apply_button.visible = True
-
-        lines = [f"\n**{len(available)} pairs available to skip:**"]
-        for (a, b), d in sorted(available, key=lambda x: x[1]):
-            lines.append(f"- {a} ↔ {b}: {d:.3f}m")
-        lines.append("\n*Click 'Skip these pairs' to stop checking them*")
-        self._collision_info.content += "\n".join(lines)
-
-    def _apply_suggestions(self) -> None:
-        """Add suggested pairs to the skip list."""
-        for pair in self._pending_suggestions:
-            self._skipped_pairs.add(pair)
-
-        self._pending_suggestions = []
-        self._apply_button.visible = False
-        self._needs_refine_update = True
-
-        # Update display
-        self.update_mesh_distances(self._mesh_distances)
 
     @property
     def excluded_collision_pairs(self) -> set[tuple[str, str]]:
