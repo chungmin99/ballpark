@@ -77,8 +77,8 @@ def main(
     while True:
         gui.poll()
 
-        # Recompute spheres when allocation settings change
-        if gui.needs_recompute:
+        # Re-spherize only when allocation or spherize params changed
+        if gui.needs_spherize:
             # Two allocation modes:
             # - Auto: robot.auto_allocate() distributes spheres by link complexity
             # - Manual: user specifies per-link counts (similar links stay synced)
@@ -99,19 +99,35 @@ def main(
                 result = robot.spherize(allocation=allocation, config=config)
                 elapsed = (time.perf_counter() - t0) * 1000
                 print(f"Generated {result.num_spheres} spheres in {elapsed:.1f}ms")
-
-                # Optionally refine spheres
-                if gui.refine_enabled:
-                    t0 = time.perf_counter()
-                    result = robot.refine(result, config=config)
-                    elapsed = (time.perf_counter() - t0) * 1000
-                    print(f"Refined spheres in {elapsed:.1f}ms")
             else:
                 result = RobotSpheresResult(link_spheres={})
 
-            sphere_visuals.update(result, gui.opacity, gui.show_spheres)
             gui.update_sphere_count(result.num_spheres)
-            gui.mark_computed()
+            gui.mark_spherized()
+            gui.set_needs_refine_update()  # Trigger refine after spherize
+
+            # Compute mesh distances for the collision pair UI
+            mesh_distances = robot.get_mesh_distances(joint_cfg=gui.joint_config)
+            gui.update_mesh_distances(mesh_distances)
+
+        # Re-refine when refine settings changed OR after new spherize
+        if gui.needs_refine_update and result is not None:
+            config = gui.get_config()
+            if gui.refine_enabled and result.num_spheres > 0:
+                t0 = time.perf_counter()
+                refined = robot.refine(
+                    result,
+                    config=config,
+                    joint_cfg=gui.joint_config,
+                    excluded_pairs=gui.excluded_collision_pairs,
+                )
+                elapsed = (time.perf_counter() - t0) * 1000
+                print(f"Refined spheres in {elapsed:.1f}ms")
+                sphere_visuals.update(refined, gui.opacity, gui.show_spheres)
+            else:
+                sphere_visuals.update(result, gui.opacity, gui.show_spheres)
+
+            gui.mark_refine_updated()
             gui.mark_visuals_updated()
 
         # Update sphere visuals if only appearance changed (opacity, visibility)
@@ -153,8 +169,15 @@ class _SpheresGui:
         self._last_refine: bool = False
         self._last_preset: str = "Balanced"
         self._last_params: dict[str, float] = {}
-        self._needs_recompute = True
+        self._last_joint_config: np.ndarray | None = None  # Track joint config changes
+        self._needs_spherize = True  # Allocation or spherize params changed
+        self._needs_refine_update = True  # Refine toggle or refine params changed
         self._needs_visual_update = True
+
+        # Collision pair tracking
+        self._mesh_distances: dict[tuple[str, str], float] = {}
+        self._skipped_pairs: set[tuple[str, str]] = set()  # User-confirmed skips
+        self._pending_suggestions: list[tuple[str, str]] = []
 
         # Current config (updated by presets or custom sliders)
         self._current_config = BallparkConfig.from_preset(SpherePreset.BALANCED)
@@ -241,32 +264,61 @@ class _SpheresGui:
 
     def poll(self) -> None:
         """Check for GUI changes and update internal state."""
-        # Preset change
+        # Preset change - affects both spherize and refine params
         if self._preset.value != self._last_preset:
             self._last_preset = self._preset.value
             self._apply_preset(self._preset.value)
-            self._needs_recompute = True
+            self._needs_spherize = True
+            self._needs_refine_update = True
 
         # Custom params change (only in Custom mode)
         if self._preset.value == "Custom" and self._params_sliders:
             current_params = self._get_params_values()
             if current_params != self._last_params:
-                self._last_params = current_params
-                self._needs_recompute = True
+                # Check which params changed
+                spherize_params = {
+                    "padding",
+                    "target_tightness",
+                    "aspect_threshold",
+                    "percentile",
+                    "max_radius_ratio",
+                    "uniform_radius",
+                    "axis_mode",
+                    "symmetry_mode",
+                    "symmetry_tolerance",
+                }
+                refine_params = {
+                    "n_iters",
+                    "tol",
+                    "lambda_under",
+                    "lambda_over",
+                    "lambda_center_reg",
+                    "lambda_radius_reg",
+                    "lambda_self_collision",
+                }
 
-        # Mode change
+                for key in current_params:
+                    if current_params[key] != self._last_params.get(key):
+                        if key in spherize_params:
+                            self._needs_spherize = True
+                        if key in refine_params:
+                            self._needs_refine_update = True
+
+                self._last_params = current_params
+
+        # Mode change - affects allocation
         if self._mode.value != self._last_mode:
             self._last_mode = self._mode.value
             is_manual = self._last_mode == "Manual"
             for slider in self._link_sliders.values():
                 slider.disabled = not is_manual
             self._total_spheres.disabled = is_manual
-            self._needs_recompute = True
+            self._needs_spherize = True
 
         # Total spheres change (auto mode)
         if self._mode.value == "Auto" and self._total_spheres.value != self._last_total:
             self._last_total = int(self._total_spheres.value)
-            self._needs_recompute = True
+            self._needs_spherize = True
 
         # Per-link slider change (manual mode)
         if self._mode.value == "Manual":
@@ -284,12 +336,12 @@ class _SpheresGui:
                 current = {name: int(s.value) for name, s in self._link_sliders.items()}
                 self._total_spheres.value = sum(current.values())
                 self._last_link_budgets = current
-                self._needs_recompute = True
+                self._needs_spherize = True
 
-        # Refine checkbox change
+        # Refine checkbox change - ONLY affects refine, not spherize
         if self._refine.value != self._last_refine:
             self._last_refine = self._refine.value
-            self._needs_recompute = True
+            self._needs_refine_update = True  # NOT _needs_spherize
 
         # Visibility/opacity change
         if (
@@ -299,6 +351,14 @@ class _SpheresGui:
             self._last_show = self._show_spheres.value
             self._last_opacity = self._opacity.value
             self._needs_visual_update = True
+
+        # Joint config change - triggers re-refine (mesh distances depend on config)
+        current_joint_config = self.joint_config
+        if self._last_joint_config is None or not np.allclose(
+            current_joint_config, self._last_joint_config, atol=1e-4
+        ):
+            self._last_joint_config = current_joint_config.copy()
+            self._needs_refine_update = True
 
     def _get_group_for_link(self, link_name: str) -> list[str] | None:
         for group in self._robot._similarity.groups:
@@ -322,27 +382,43 @@ class _SpheresGui:
             # Spherize parameters
             with self._server.gui.add_folder("Spherize"):
                 self._params_sliders["padding"] = self._server.gui.add_slider(
-                    "padding", min=1.0, max=1.2, step=0.01,
+                    "padding",
+                    min=1.0,
+                    max=1.2,
+                    step=0.01,
                     initial_value=cfg.spherize.padding,
                 )
                 self._params_sliders["target_tightness"] = self._server.gui.add_slider(
-                    "target_tightness", min=1.0, max=2.0, step=0.05,
+                    "target_tightness",
+                    min=1.0,
+                    max=2.0,
+                    step=0.05,
                     initial_value=cfg.spherize.target_tightness,
                 )
                 self._params_sliders["aspect_threshold"] = self._server.gui.add_slider(
-                    "aspect_threshold", min=1.0, max=2.0, step=0.05,
+                    "aspect_threshold",
+                    min=1.0,
+                    max=2.0,
+                    step=0.05,
                     initial_value=cfg.spherize.aspect_threshold,
                 )
                 self._params_sliders["percentile"] = self._server.gui.add_slider(
-                    "percentile", min=90.0, max=100.0, step=0.5,
+                    "percentile",
+                    min=90.0,
+                    max=100.0,
+                    step=0.5,
                     initial_value=cfg.spherize.percentile,
                 )
                 self._params_sliders["max_radius_ratio"] = self._server.gui.add_slider(
-                    "max_radius_ratio", min=0.2, max=0.8, step=0.05,
+                    "max_radius_ratio",
+                    min=0.2,
+                    max=0.8,
+                    step=0.05,
                     initial_value=cfg.spherize.max_radius_ratio,
                 )
                 self._params_sliders["uniform_radius"] = self._server.gui.add_checkbox(
-                    "uniform_radius", initial_value=cfg.spherize.uniform_radius,
+                    "uniform_radius",
+                    initial_value=cfg.spherize.uniform_radius,
                 )
                 self._params_sliders["axis_mode"] = self._server.gui.add_dropdown(
                     "axis_mode",
@@ -354,70 +430,71 @@ class _SpheresGui:
                     options=["auto", "off", "force"],
                     initial_value=cfg.spherize.symmetry_mode,
                 )
-                self._params_sliders["symmetry_tolerance"] = self._server.gui.add_slider(
-                    "symmetry_tolerance", min=0.01, max=0.2, step=0.01,
-                    initial_value=cfg.spherize.symmetry_tolerance,
+                self._params_sliders["symmetry_tolerance"] = (
+                    self._server.gui.add_slider(
+                        "symmetry_tolerance",
+                        min=0.01,
+                        max=0.2,
+                        step=0.01,
+                        initial_value=cfg.spherize.symmetry_tolerance,
+                    )
                 )
 
             # Refine optimization parameters
             with self._server.gui.add_folder("Optimization"):
-                self._params_sliders["lr"] = self._server.gui.add_slider(
-                    "lr", min=0.0001, max=0.01, step=0.0001,
-                    initial_value=cfg.refine.lr,
-                )
                 self._params_sliders["n_iters"] = self._server.gui.add_slider(
-                    "n_iters", min=10, max=500, step=10,
+                    "n_iters",
+                    min=10,
+                    max=500,
+                    step=10,
                     initial_value=cfg.refine.n_iters,
                 )
                 self._params_sliders["tol"] = self._server.gui.add_slider(
-                    "tol", min=1e-6, max=1e-2, step=1e-5,
+                    "tol",
+                    min=1e-6,
+                    max=1e-2,
+                    step=1e-5,
                     initial_value=cfg.refine.tol,
                 )
 
-            # Per-link loss weights
-            with self._server.gui.add_folder("Per-Link Losses"):
+            # Loss weights (only those implemented in _refine.py)
+            with self._server.gui.add_folder("Losses"):
                 self._params_sliders["lambda_under"] = self._server.gui.add_slider(
-                    "lambda_under", min=0.0, max=5.0, step=0.1,
+                    "lambda_under",
+                    min=0.0,
+                    max=5.0,
+                    step=0.001,
                     initial_value=cfg.refine.lambda_under,
                 )
                 self._params_sliders["lambda_over"] = self._server.gui.add_slider(
-                    "lambda_over", min=0.0, max=0.1, step=0.001,
+                    "lambda_over",
+                    min=0.0,
+                    max=0.1,
+                    step=0.001,
                     initial_value=cfg.refine.lambda_over,
                 )
-                self._params_sliders["lambda_overlap"] = self._server.gui.add_slider(
-                    "lambda_overlap", min=0.0, max=0.5, step=0.01,
-                    initial_value=cfg.refine.lambda_overlap,
-                )
-                self._params_sliders["lambda_uniform"] = self._server.gui.add_slider(
-                    "lambda_uniform", min=0.0, max=1.0, step=0.05,
-                    initial_value=cfg.refine.lambda_uniform,
-                )
-                self._params_sliders["lambda_surface"] = self._server.gui.add_slider(
-                    "lambda_surface", min=0.0, max=1.0, step=0.05,
-                    initial_value=cfg.refine.lambda_surface,
-                )
-                self._params_sliders["lambda_sqem"] = self._server.gui.add_slider(
-                    "lambda_sqem", min=0.0, max=1.0, step=0.05,
-                    initial_value=cfg.refine.lambda_sqem,
-                )
-
-            # Robot-level loss weights
-            with self._server.gui.add_folder("Robot-Level Losses"):
-                self._params_sliders["lambda_self_collision"] = self._server.gui.add_slider(
-                    "lambda_self_collision", min=0.0, max=10.0, step=0.1,
-                    initial_value=cfg.refine.lambda_self_collision,
-                )
                 self._params_sliders["lambda_center_reg"] = self._server.gui.add_slider(
-                    "lambda_center_reg", min=0.0, max=10.0, step=0.1,
+                    "lambda_center_reg",
+                    min=0.0,
+                    max=10.0,
+                    step=0.001,
                     initial_value=cfg.refine.lambda_center_reg,
                 )
-                self._params_sliders["lambda_similarity"] = self._server.gui.add_slider(
-                    "lambda_similarity", min=0.0, max=10.0, step=0.1,
-                    initial_value=cfg.refine.lambda_similarity,
+                self._params_sliders["lambda_radius_reg"] = self._server.gui.add_slider(
+                    "lambda_radius_reg",
+                    min=0.0,
+                    max=10.0,
+                    step=0.001,
+                    initial_value=cfg.refine.lambda_radius_reg,
                 )
-                self._params_sliders["mesh_collision_tolerance"] = self._server.gui.add_slider(
-                    "mesh_collision_tol", min=0.0, max=0.05, step=0.001,
-                    initial_value=cfg.refine.mesh_collision_tolerance,
+                self._params_sliders["lambda_self_collision"] = (
+                    self._server.gui.add_slider(
+                        "lambda_self_collision",
+                        min=0.0,
+                        max=10.0,
+                        step=0.001,
+                        initial_value=cfg.refine.lambda_self_collision,
+                    )
                 )
 
         # Cache initial values
@@ -472,19 +549,13 @@ class _SpheresGui:
                 symmetry_tolerance=float(p["symmetry_tolerance"].value),
             ),
             refine=RefineParams(
-                lr=float(p["lr"].value),
                 n_iters=int(p["n_iters"].value),
                 tol=float(p["tol"].value),
                 lambda_under=float(p["lambda_under"].value),
                 lambda_over=float(p["lambda_over"].value),
-                lambda_overlap=float(p["lambda_overlap"].value),
-                lambda_uniform=float(p["lambda_uniform"].value),
-                lambda_surface=float(p["lambda_surface"].value),
-                lambda_sqem=float(p["lambda_sqem"].value),
-                lambda_self_collision=float(p["lambda_self_collision"].value),
                 lambda_center_reg=float(p["lambda_center_reg"].value),
-                lambda_similarity=float(p["lambda_similarity"].value),
-                mesh_collision_tolerance=float(p["mesh_collision_tolerance"].value),
+                lambda_radius_reg=float(p["lambda_radius_reg"].value),
+                lambda_self_collision=float(p["lambda_self_collision"].value),
             ),
         )
 
@@ -507,12 +578,31 @@ class _SpheresGui:
             slider.value = alloc.get(name, 0)
         self._last_link_budgets = alloc
 
-    @property
-    def needs_recompute(self) -> bool:
-        return self._needs_recompute
+    def update_mesh_distances(self, distances: dict[tuple[str, str], float]) -> None:
+        """Update the collision pair info with mesh distances."""
+        self._mesh_distances = distances
 
-    def mark_computed(self) -> None:
-        self._needs_recompute = False
+    @property
+    def excluded_collision_pairs(self) -> set[tuple[str, str]]:
+        """Return user-skipped pairs."""
+        return self._skipped_pairs.copy()
+
+    @property
+    def needs_spherize(self) -> bool:
+        return self._needs_spherize
+
+    def mark_spherized(self) -> None:
+        self._needs_spherize = False
+
+    @property
+    def needs_refine_update(self) -> bool:
+        return self._needs_refine_update
+
+    def set_needs_refine_update(self) -> None:
+        self._needs_refine_update = True
+
+    def mark_refine_updated(self) -> None:
+        self._needs_refine_update = False
 
     @property
     def needs_visual_update(self) -> bool:

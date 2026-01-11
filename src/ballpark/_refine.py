@@ -1,4 +1,4 @@
-"""Robot-level sphere refinement with JAX/optax optimization."""
+"""Robot-level sphere refinement with jaxls nonlinear least squares optimization."""
 
 from __future__ import annotations
 
@@ -8,17 +8,48 @@ import numpy as np
 import trimesh
 import jax
 import jax.numpy as jnp
-from jax import lax
 import jax_dataclasses as jdc
 import jaxlie
-import optax
+import jaxls
 from loguru import logger
-from scipy.optimize import linear_sum_assignment
 
 from ._spherize import Sphere
-from ._similarity import SimilarityResult
 from ._config import RefineParams
-from .utils._mesh_utils import compute_mesh_distances_batch
+
+
+# =============================================================================
+# Helper functions
+# =============================================================================
+
+
+def _transform_point(center: jax.Array, transform: jax.Array) -> jax.Array:
+    """Transform a point from link frame to world frame.
+
+    Args:
+        center: (3,) point in link frame
+        transform: (7,) array [qw, qx, qy, qz, x, y, z]
+
+    Returns:
+        (3,) point in world frame
+    """
+    wxyz = transform[:4]
+    xyz = transform[4:]
+    so3 = jaxlie.SO3(wxyz=wxyz)
+    return so3 @ center + xyz
+
+
+# =============================================================================
+# jaxls Variable Type
+# =============================================================================
+
+
+class SphereVar(
+    jaxls.Var[Sphere],
+    default_factory=lambda: Sphere(center=jnp.zeros(3), radius=jnp.array(0.01)),
+):
+    """Variable type for sphere parameters (center + radius)."""
+
+    pass
 
 
 # =============================================================================
@@ -37,7 +68,6 @@ class _FlattenedSphereData:
 
     # Batched spheres
     spheres: Sphere  # center: (N, 3), radius: (N,)
-    initial_spheres: Sphere  # copy for regularization
 
     # Point data
     points_all: jnp.ndarray  # (P, 3) all surface points concatenated
@@ -45,7 +75,8 @@ class _FlattenedSphereData:
     # Index mappings for per-link operations
     sphere_to_link: jnp.ndarray  # (N,) int32 - which link each sphere belongs to
     point_to_link: jnp.ndarray  # (P,) int32 - which link each point belongs to
-    sphere_link_mask: jnp.ndarray  # (N, N) bool - True if spheres on same link
+
+    # FK transforms for self-collision
     sphere_transforms: jnp.ndarray  # (N, 7) FK transform (wxyz+xyz) per sphere
 
     # Metadata (static - not traced by JAX)
@@ -54,96 +85,7 @@ class _FlattenedSphereData:
     link_names: jdc.Static[tuple[str, ...]]
     n_spheres: jdc.Static[int]
     n_links: jdc.Static[int]
-    scale: jdc.Static[float]
-
-
-@jdc.pytree_dataclass
-class RobotRefineContext:
-    """Robot-level optimization context.
-
-    Contains data specific to robot refinement that is computed after
-    flattening spheres (collision pairs, similarity matching).
-    """
-
-    collision_pair_mask: jnp.ndarray  # (N, N) bool - pairs to check for collision
-    similarity_pairs: jnp.ndarray  # (M, 2) int32 - matched sphere indices
-    params: RefineParams
-
-
-# =============================================================================
-# Self-collision utilities
-# =============================================================================
-
-
-def compute_min_self_collision_distance(
-    link_spheres: dict[str, list[Sphere]],
-    all_link_names: list[str],
-    joint_limits: tuple[np.ndarray, np.ndarray],
-    compute_transforms: Callable[[np.ndarray], np.ndarray],
-    non_contiguous_pairs: list[tuple[str, str]],
-    valid_pairs: list[tuple[str, str]] | None = None,
-    joint_cfg: np.ndarray | None = None,
-) -> float:
-    """Compute the minimum signed distance between spheres of non-contiguous links.
-
-    Args:
-        link_spheres: Dict mapping link names to lists of Sphere objects.
-        all_link_names: Ordered list of all link names.
-        joint_limits: Tuple of (lower_limits, upper_limits) arrays.
-        compute_transforms: Function that takes joint_cfg and returns (N, 7) transforms.
-        non_contiguous_pairs: List of (link_a, link_b) pairs that are not adjacent.
-        valid_pairs: If provided, only check these pairs instead of non_contiguous_pairs.
-        joint_cfg: Joint configuration for FK. If None, uses middle of limits.
-
-    Returns:
-        Minimum signed distance. Negative = collision, positive = clearance.
-    """
-    links_with_spheres = [name for name in all_link_names if link_spheres.get(name)]
-    if not links_with_spheres:
-        return float("inf")
-
-    link_name_to_idx = {name: idx for idx, name in enumerate(all_link_names)}
-
-    if joint_cfg is None:
-        lower, upper = joint_limits
-        joint_cfg = (lower + upper) / 2
-    Ts = compute_transforms(joint_cfg)
-
-    pairs_to_check = valid_pairs if valid_pairs is not None else non_contiguous_pairs
-
-    min_dist = float("inf")
-
-    for link_a, link_b in pairs_to_check:
-        spheres_a = link_spheres.get(link_a, [])
-        spheres_b = link_spheres.get(link_b, [])
-
-        if not spheres_a or not spheres_b:
-            continue
-
-        idx_a = link_name_to_idx[link_a]
-        idx_b = link_name_to_idx[link_b]
-
-        T_a = Ts[idx_a]
-        T_b = Ts[idx_b]
-
-        wxyz_a, xyz_a = T_a[:4], T_a[4:]
-        wxyz_b, xyz_b = T_b[:4], T_b[4:]
-
-        so3_a = jaxlie.SO3(wxyz=wxyz_a)
-        so3_b = jaxlie.SO3(wxyz=wxyz_b)
-
-        for sphere_i in spheres_a:
-            center_i_world = np.array(so3_a @ sphere_i.center) + xyz_a
-
-            for sphere_j in spheres_b:
-                center_j_world = np.array(so3_b @ sphere_j.center) + xyz_b
-
-                dist = np.linalg.norm(center_i_world - center_j_world)
-                signed_dist = float(dist - (sphere_i.radius + sphere_j.radius))
-
-                min_dist = min(min_dist, signed_dist)
-
-    return min_dist
+    scale: float
 
 
 # =============================================================================
@@ -157,18 +99,24 @@ def _build_flattened_sphere_data(
     link_names: list[str],
     Ts: np.ndarray,
     link_name_to_idx: dict[str, int],
-) -> tuple[_FlattenedSphereData, list] | tuple[None, None]:
+) -> _FlattenedSphereData | None:
     """Flatten per-link sphere/point dicts into arrays for JAX optimization.
 
+    Args:
+        link_spheres: Dict mapping link names to lists of Sphere objects.
+        link_points: Dict mapping link names to surface point arrays.
+        link_names: Ordered list of link names with spheres.
+        Ts: FK transforms for all links, shape (num_all_links, 7).
+        link_name_to_idx: Maps link name to index in Ts.
+
     Returns:
-        Tuple of (flattened_data, all_centers_list) or (None, None) if no spheres.
-        all_centers_list is returned separately for similarity pair computation.
+        Flattened data or None if no spheres.
     """
-    all_centers = []
-    all_radii = []
-    all_points = []
-    link_sphere_ranges = []
-    link_point_ranges = []
+    all_centers: list[np.ndarray] = []
+    all_radii: list[np.ndarray] = []
+    all_points: list[np.ndarray] = []
+    link_sphere_ranges: list[tuple[int, int]] = []
+    link_point_ranges: list[tuple[int, int]] = []
 
     sphere_idx = 0
     point_idx = 0
@@ -191,7 +139,7 @@ def _build_flattened_sphere_data(
         link_point_ranges.append((start_point, point_idx))
 
     if not all_centers:
-        return None, None
+        return None
 
     n_spheres = len(all_centers)
     n_links = len(link_names)
@@ -202,15 +150,14 @@ def _build_flattened_sphere_data(
 
     # Create batched Sphere objects
     spheres = Sphere(center=centers, radius=radii)
-    initial_spheres = Sphere(center=centers, radius=radii)
 
-    sphere_to_link_list = []
+    sphere_to_link_list: list[int] = []
     for i, link_name in enumerate(link_names):
         n_in_link = len(link_spheres[link_name])
         sphere_to_link_list.extend([i] * n_in_link)
     sphere_to_link = jnp.array(sphere_to_link_list, dtype=jnp.int32)
 
-    point_to_link_list = []
+    point_to_link_list: list[int] = []
     for i, link_name in enumerate(link_names):
         points = link_points.get(link_name, np.zeros((0, 3)))
         point_to_link_list.extend([i] * len(points))
@@ -218,16 +165,6 @@ def _build_flattened_sphere_data(
         point_to_link = jnp.array(point_to_link_list, dtype=jnp.int32)
     else:
         point_to_link = jnp.zeros((1,), dtype=jnp.int32)
-
-    sphere_link_mask = sphere_to_link[:, None] == sphere_to_link[None, :]
-
-    sphere_transforms_list = []
-    for link_name in link_names:
-        transform_idx = link_name_to_idx[link_name]
-        T = Ts[transform_idx]
-        n_in_link = len(link_spheres[link_name])
-        sphere_transforms_list.extend([T] * n_in_link)
-    sphere_transforms = jnp.array(sphere_transforms_list)
 
     if len(all_points) > 0:
         points_stacked = np.vstack(all_points)
@@ -240,13 +177,20 @@ def _build_flattened_sphere_data(
         )
     scale = float(bbox_diag + 1e-8)
 
-    flat_data = _FlattenedSphereData(
+    # Build sphere transforms (assign each sphere its link's FK transform)
+    sphere_transforms_list: list[np.ndarray] = []
+    for link_name in link_names:
+        transform_idx = link_name_to_idx[link_name]
+        T = Ts[transform_idx]
+        n_in_link = len(link_spheres[link_name])
+        sphere_transforms_list.extend([T] * n_in_link)
+    sphere_transforms = jnp.array(sphere_transforms_list)
+
+    return _FlattenedSphereData(
         spheres=spheres,
-        initial_spheres=initial_spheres,
         points_all=points_all,
         sphere_to_link=sphere_to_link,
         point_to_link=point_to_link,
-        sphere_link_mask=sphere_link_mask,
         sphere_transforms=sphere_transforms,
         link_sphere_ranges=tuple(link_sphere_ranges),
         link_point_ranges=tuple(link_point_ranges),
@@ -255,131 +199,6 @@ def _build_flattened_sphere_data(
         n_links=n_links,
         scale=scale,
     )
-    return flat_data, all_centers
-
-
-def _build_collision_pair_mask(
-    n_spheres: int,
-    link_names: list[str],
-    link_sphere_ranges: list[tuple[int, int]],
-    non_contiguous_pairs: list[tuple[str, str]],
-    mesh_distances: dict[tuple[str, str], float],
-    mesh_collision_tolerance: float,
-) -> tuple[jnp.ndarray, list[tuple[str, str]], list[tuple[str, str, float]]]:
-    """Build boolean mask indicating which sphere pairs to check for collision."""
-    link_name_to_internal_idx = {name: i for i, name in enumerate(link_names)}
-
-    collision_pair_mask = np.zeros((n_spheres, n_spheres), dtype=bool)
-
-    pairs_with_spheres = []
-    for link_a, link_b in non_contiguous_pairs:
-        internal_idx_a = link_name_to_internal_idx[link_a]
-        internal_idx_b = link_name_to_internal_idx[link_b]
-        range_a = link_sphere_ranges[internal_idx_a]
-        range_b = link_sphere_ranges[internal_idx_b]
-        if range_a[0] < range_a[1] and range_b[0] < range_b[1]:
-            pairs_with_spheres.append((link_a, link_b))
-
-    skipped_pairs = []
-    valid_pairs = []
-
-    for link_a, link_b in pairs_with_spheres:
-        internal_idx_a = link_name_to_internal_idx[link_a]
-        internal_idx_b = link_name_to_internal_idx[link_b]
-        range_a = link_sphere_ranges[internal_idx_a]
-        range_b = link_sphere_ranges[internal_idx_b]
-
-        mesh_dist = mesh_distances.get(
-            (link_a, link_b), mesh_distances.get((link_b, link_a), float("inf"))
-        )
-
-        if mesh_dist < mesh_collision_tolerance:
-            skipped_pairs.append((link_a, link_b, mesh_dist))
-        else:
-            valid_pairs.append((link_a, link_b))
-            for i in range(range_a[0], range_a[1]):
-                for j in range(range_b[0], range_b[1]):
-                    collision_pair_mask[i, j] = True
-                    collision_pair_mask[j, i] = True
-
-    return jnp.array(collision_pair_mask), valid_pairs, skipped_pairs
-
-
-def _build_similarity_pairs(
-    similarity_result: SimilarityResult | None,
-    link_names: list[str],
-    link_sphere_ranges: list[tuple[int, int]],
-    all_centers: list,
-    lambda_similarity: float,
-) -> tuple[jnp.ndarray, list[tuple[int, int]]]:
-    """Build sphere correspondence pairs for similarity regularization."""
-    link_name_to_internal_idx = {name: i for i, name in enumerate(link_names)}
-    similarity_pairs = []
-
-    if similarity_result is None or lambda_similarity <= 0:
-        return jnp.zeros((0, 2), dtype=jnp.int32), []
-
-    for group in similarity_result.groups:
-        group_links = [l for l in group if l in link_name_to_internal_idx]
-        if len(group_links) < 2:
-            continue
-
-        first_link = group_links[0]
-        first_internal_idx = link_name_to_internal_idx[first_link]
-        first_range = link_sphere_ranges[first_internal_idx]
-        n_first = first_range[1] - first_range[0]
-
-        if n_first == 0:
-            continue
-
-        first_centers_np = np.array(all_centers[first_range[0] : first_range[1]])
-
-        for other_link in group_links[1:]:
-            other_internal_idx = link_name_to_internal_idx[other_link]
-            other_range = link_sphere_ranges[other_internal_idx]
-            n_other = other_range[1] - other_range[0]
-
-            if n_other == 0:
-                continue
-
-            other_centers_np = np.array(all_centers[other_range[0] : other_range[1]])
-
-            transform = similarity_result.transforms.get(
-                (first_link, other_link), np.eye(4)
-            )
-
-            first_centers_homo = np.hstack([first_centers_np, np.ones((n_first, 1))])
-            first_transformed = (transform @ first_centers_homo.T).T[:, :3]
-
-            cost_matrix = np.zeros((n_first, n_other))
-            for i in range(n_first):
-                for j in range(n_other):
-                    cost_matrix[i, j] = np.sum(
-                        (first_transformed[i] - other_centers_np[j]) ** 2
-                    )
-
-            row_ind, col_ind = linear_sum_assignment(cost_matrix)
-
-            n_match = min(n_first, n_other)
-            for i, j in zip(row_ind[:n_match], col_ind[:n_match]):
-                global_i = first_range[0] + i
-                global_j = other_range[0] + j
-                similarity_pairs.append((global_i, global_j))
-
-            if abs(n_first - n_other) > max(n_first, n_other) * 0.2:
-                logger.warning(
-                    f"Sphere count mismatch between "
-                    f"{first_link} ({n_first}) and {other_link} ({n_other}). "
-                    f"Only {len(row_ind)} of {max(n_first, n_other)} "
-                    f"spheres will be regularized"
-                )
-
-    if similarity_pairs:
-        similarity_pairs_array = jnp.array(similarity_pairs, dtype=jnp.int32)
-    else:
-        similarity_pairs_array = jnp.zeros((0, 2), dtype=jnp.int32)
-
-    return similarity_pairs_array, similarity_pairs
 
 
 def _unflatten_to_link_spheres(
@@ -406,220 +225,431 @@ def _unflatten_to_link_spheres(
 
 
 # =============================================================================
-# Loss functions (internal)
+# jaxls Cost Functions
 # =============================================================================
 
 
-def _compute_robot_loss(
-    spheres: Sphere,
-    data: _FlattenedSphereData,
-    ctx: RobotRefineContext,
-) -> jnp.ndarray:
-    """Compute total loss for robot-level sphere refinement (JIT-compatible).
+@jaxls.Cost.factory
+def _under_approx_cost(
+    vals: jaxls.VarValues,
+    sphere_vars: tuple[SphereVar, ...],
+    points: jax.Array,
+    sphere_mask: jax.Array,
+    point_mask: jax.Array,
+    lambda_under: float,
+) -> jax.Array:
+    """Vectorized under-approximation: penalize points outside ALL spheres.
+
+    Uses fixed-size inputs with masking to enable single JIT compilation
+    regardless of actual sphere/point counts per link.
 
     Args:
-        spheres: Current sphere state being optimized (center: (N,3), radius: (N,))
-        data: Flattened sphere/point data with index mappings
-        ctx: Robot refinement context with collision masks and params
+        vals: Variable values from optimizer
+        sphere_vars: Tuple of sphere variables (fixed length, padded)
+        points: Surface points (fixed shape, padded), shape (max_P, 3)
+        sphere_mask: Boolean mask for valid spheres, shape (max_S,)
+        point_mask: Boolean mask for valid points, shape (max_P,)
+        lambda_under: Weight for under-approximation penalty
+
+    Returns:
+        Residual vector of shape (max_P,), masked for invalid points
     """
-    # Unpack for readability
-    centers = spheres.center
-    radii = jnp.maximum(spheres.radius, ctx.params.min_radius)
-    initial_centers = data.initial_spheres.center
-    initial_radii = data.initial_spheres.radius
-    points_all = data.points_all
-    scale = data.scale
-    n_links = data.n_links
-    sphere_to_link = data.sphere_to_link
-    point_to_link = data.point_to_link
-    sphere_link_mask = data.sphere_link_mask
-    sphere_transforms = data.sphere_transforms
-    collision_pair_mask = ctx.collision_pair_mask
-    similarity_pairs = ctx.similarity_pairs
-    params = ctx.params
+    # Stack sphere centers and radii (tuple length is static, loop unrolls)
+    centers = jnp.stack([vals[sv].center for sv in sphere_vars])  # (S, 3)
+    radii = jnp.stack([vals[sv].radius for sv in sphere_vars])  # (S,)
 
-    n_spheres = centers.shape[0]
-    n_points = points_all.shape[0]
+    # Broadcast: points (P, 1, 3) - centers (1, S, 3) -> diff (P, S, 3)
+    diff = points[:, None, :] - centers[None, :, :]
+    dists = jnp.sqrt(jnp.sum(diff**2, axis=-1) + 1e-8)  # (P, S)
+    signed_dists = dists - radii[None, :]  # (P, S)
 
-    total_loss = jnp.array(0.0)
+    # Mask invalid spheres (set to +inf so they don't affect min)
+    signed_dists = jnp.where(sphere_mask[None, :], signed_dists, jnp.inf)
 
-    # Transform centers to world coordinates for self-collision
-    def transform_single_center(center, transform):
-        wxyz = transform[:4]
-        xyz = transform[4:]
-        so3 = jaxlie.SO3(wxyz=wxyz)
-        return so3 @ center + xyz
+    # Min over spheres: point is covered if inside ANY sphere
+    min_signed_dist = jnp.min(signed_dists, axis=1)  # (P,)
 
-    world_centers_current = jax.vmap(transform_single_center)(
-        centers, sphere_transforms
+    # Compute residuals, zeroing out invalid points
+    residuals = jnp.sqrt(lambda_under) * jnp.maximum(0.0, min_signed_dist)
+    return jnp.where(point_mask, residuals, 0.0)
+
+
+@jaxls.Cost.factory
+def _over_approx_cost(
+    vals: jaxls.VarValues,
+    sphere_var: SphereVar,
+    scale: float,
+    lambda_over: float,
+) -> jax.Array:
+    """Over-approximation cost: penalize large sphere volumes."""
+    sphere = vals[sphere_var]
+    radius = jnp.maximum(sphere.radius, 1e-4)
+    # Residual proportional to radius^1.5 (volume^0.5)
+    return jnp.sqrt(lambda_over) * (radius / scale) ** 1.5
+
+
+@jaxls.Cost.factory
+def _center_reg_cost(
+    vals: jaxls.VarValues,
+    sphere_var: SphereVar,
+    init_center: jax.Array,
+    scale: float,
+    lambda_center_reg: float,
+) -> jax.Array:
+    """Center regularization: penalize deviation from initial center position.
+
+    Args:
+        vals: Variable values from optimizer
+        sphere_var: Sphere variable
+        init_center: Initial center position, shape (3,)
+        scale: Scale factor for normalization
+        lambda_center_reg: Weight for regularization
+
+    Returns:
+        Residual vector of shape (3,), one per coordinate
+    """
+    sphere = vals[sphere_var]
+    return jnp.sqrt(lambda_center_reg) * (sphere.center - init_center) / scale
+
+
+@jaxls.Cost.factory
+def _radius_reg_cost(
+    vals: jaxls.VarValues,
+    sphere_var: SphereVar,
+    init_radius: jax.Array,
+    scale: float,
+    lambda_radius_reg: float,
+) -> jax.Array:
+    """Radius regularization: penalize deviation from initial radius.
+
+    Args:
+        vals: Variable values from optimizer
+        sphere_var: Sphere variable
+        init_radius: Initial radius value
+        scale: Scale factor for normalization
+        lambda_radius_reg: Weight for regularization
+
+    Returns:
+        Scalar residual
+    """
+    sphere = vals[sphere_var]
+    return jnp.sqrt(lambda_radius_reg) * (sphere.radius - init_radius) / scale
+
+
+@jaxls.Cost.factory
+def _self_collision_cost(
+    vals: jaxls.VarValues,
+    sphere_var_i: SphereVar,
+    sphere_var_j: SphereVar,
+    transform_i: jax.Array,
+    transform_j: jax.Array,
+    lambda_self_collision: float,
+) -> jax.Array:
+    """Self-collision cost for a pair of spheres from non-contiguous links.
+
+    Penalizes penetration (negative signed distance) between spheres.
+
+    Args:
+        vals: Variable values from optimizer
+        sphere_var_i: First sphere variable
+        sphere_var_j: Second sphere variable
+        transform_i: FK transform for first sphere's link, (7,) wxyz+xyz
+        transform_j: FK transform for second sphere's link, (7,) wxyz+xyz
+        lambda_self_collision: Weight for self-collision penalty
+
+    Returns:
+        Scalar residual (sqrt(lambda) * penetration_depth)
+    """
+    sphere_i = vals[sphere_var_i]
+    sphere_j = vals[sphere_var_j]
+
+    # Transform centers to world frame
+    center_i_world = _transform_point(sphere_i.center, transform_i)
+    center_j_world = _transform_point(sphere_j.center, transform_j)
+
+    # Compute signed distance (negative = penetration)
+    dist = jnp.sqrt(jnp.sum((center_i_world - center_j_world) ** 2) + 1e-8)
+    sum_radii = sphere_i.radius + sphere_j.radius
+    signed_dist = dist - sum_radii
+
+    # Penalize penetration only: max(0, -signed_dist)
+    penetration = jnp.maximum(0.0, -signed_dist)
+    return jnp.sqrt(lambda_self_collision) * penetration
+
+
+def _build_collision_pairs(
+    link_names: list[str],
+    link_sphere_ranges: list[tuple[int, int]],
+    non_contiguous_pairs: list[tuple[str, str]],
+    excluded_pairs: set[tuple[str, str]] | None = None,
+) -> tuple[list[tuple[int, int]], list[tuple[str, str]]]:
+    """Build list of sphere index pairs to check for self-collision.
+
+    Args:
+        link_names: Ordered list of link names with spheres.
+        link_sphere_ranges: (start, end) sphere indices for each link.
+        non_contiguous_pairs: Link pairs that are not adjacent in kinematic chain.
+        excluded_pairs: Link pairs to skip (user-disabled).
+
+    Returns:
+        Tuple of (sphere_pairs, valid_link_pairs) where:
+        - sphere_pairs: List of (sphere_idx_i, sphere_idx_j) to check
+        - valid_link_pairs: Link pairs that passed filtering (for logging)
+    """
+    link_name_to_internal_idx = {name: i for i, name in enumerate(link_names)}
+
+    sphere_pairs: list[tuple[int, int]] = []
+    valid_link_pairs: list[tuple[str, str]] = []
+
+    for link_a, link_b in non_contiguous_pairs:
+        # Skip user-excluded pairs
+        if excluded_pairs:
+            if (link_a, link_b) in excluded_pairs or (link_b, link_a) in excluded_pairs:
+                continue
+        # Skip if either link not in our optimization set
+        if link_a not in link_name_to_internal_idx:
+            continue
+        if link_b not in link_name_to_internal_idx:
+            continue
+
+        internal_idx_a = link_name_to_internal_idx[link_a]
+        internal_idx_b = link_name_to_internal_idx[link_b]
+        range_a = link_sphere_ranges[internal_idx_a]
+        range_b = link_sphere_ranges[internal_idx_b]
+
+        # Skip if either link has no spheres
+        if range_a[0] >= range_a[1] or range_b[0] >= range_b[1]:
+            continue
+
+        valid_link_pairs.append((link_a, link_b))
+
+        # Add all sphere pairs between these links
+        for i in range(range_a[0], range_a[1]):
+            for j in range(range_b[0], range_b[1]):
+                sphere_pairs.append((i, j))
+
+    return sphere_pairs, valid_link_pairs
+
+
+def _build_jaxls_costs(
+    data: _FlattenedSphereData,
+    params: RefineParams,
+    collision_pairs: list[tuple[int, int]],
+) -> list[jaxls.Cost]:
+    """Build optimization costs for sphere refinement.
+
+    Includes:
+    - Under-approximation: penalize points outside spheres
+    - Over-approximation: penalize large sphere volumes
+    - Center regularization: penalize deviation from initial positions
+    - Radius regularization: penalize deviation from initial radii
+    - Self-collision: penalize overlap between non-adjacent link spheres
+
+    Args:
+        data: Flattened sphere/point data
+        params: Refinement parameters
+        collision_pairs: List of (sphere_idx_i, sphere_idx_j) pairs to check
+
+    Returns:
+        List of jaxls.Cost objects
+    """
+    costs: list[jaxls.Cost] = []
+    n_spheres = data.n_spheres
+    sphere_vars = SphereVar(jnp.arange(n_spheres))
+
+    # Find max spheres and points per link for padding
+    max_spheres_per_link = max(
+        end - start for start, end in data.link_sphere_ranges
+    )
+    max_points_per_link = max(
+        end - start for start, end in data.link_point_ranges
     )
 
-    # 1. Under-approximation loss (per-link, using masks)
-    if n_points > 0:
-        diff_pts = points_all[:, None, :] - centers[None, :, :]
-        dists_to_centers = jnp.sqrt(jnp.sum(diff_pts**2, axis=-1) + 1e-8)
-        signed_dists = dists_to_centers - radii[None, :]
+    # Under-approximation costs: one per link with padded fixed dimensions
+    for link_idx in range(data.n_links):
+        point_start, point_end = data.link_point_ranges[link_idx]
+        sphere_start, sphere_end = data.link_sphere_ranges[link_idx]
 
-        same_link_mask = point_to_link[:, None] == sphere_to_link[None, :]
-        signed_dists_masked = jnp.where(same_link_mask, signed_dists, jnp.inf)
-        min_signed_dist = jnp.min(signed_dists_masked, axis=1)
+        n_link_spheres = sphere_end - sphere_start
+        n_link_points = point_end - point_start
 
-        valid_points = jnp.isfinite(min_signed_dist)
-        under_approx = jnp.sum(
-            jnp.where(valid_points, jnp.maximum(0.0, min_signed_dist) ** 2, 0.0)
-        )
-        under_approx = under_approx / (jnp.sum(valid_points) + 1e-8)
-        total_loss = total_loss + params.lambda_under * under_approx
+        if n_link_points == 0 or n_link_spheres == 0:
+            continue
 
-    # 2. Over-approximation loss (all spheres)
-    over_approx = jnp.mean((radii / scale) ** 3)
-    total_loss = total_loss + params.lambda_over * over_approx
+        # Get link data
+        link_points = data.points_all[point_start:point_end]
 
-    # 3. Intra-link overlap loss (only between spheres of same link)
-    if n_spheres > 1:
-        center_diff = centers[:, None, :] - centers[None, :, :]
-        center_dists = jnp.sqrt(jnp.sum(center_diff**2, axis=-1) + 1e-8)
-        sum_radii_mat = radii[:, None] + radii[None, :]
-        overlap_depth = jnp.maximum(0.0, sum_radii_mat - center_dists)
-
-        triu_mask = jnp.triu(jnp.ones((n_spheres, n_spheres)), k=1)
-        intra_link_mask = sphere_link_mask * triu_mask
-
-        overlap_loss = jnp.sum(intra_link_mask * overlap_depth**2) / (
-            jnp.sum(intra_link_mask) + 1e-8
-        )
-        total_loss = total_loss + params.lambda_overlap * overlap_loss
-
-    # 4. Uniformity loss (per-link variance, aggregated)
-    if n_spheres > 1:
-        ones = jnp.ones(n_spheres)
-        link_counts = jax.ops.segment_sum(ones, sphere_to_link, num_segments=n_links)
-
-        link_radius_sum = jax.ops.segment_sum(
-            radii, sphere_to_link, num_segments=n_links
+        # Pad points to max size
+        padded_points = jnp.pad(
+            link_points,
+            ((0, max_points_per_link - n_link_points), (0, 0)),
         )
 
-        link_mean = link_radius_sum / (link_counts + 1e-8)
-        sphere_mean = link_mean[sphere_to_link]
-
-        squared_dev = (radii - sphere_mean) ** 2
-        link_var_sum = jax.ops.segment_sum(
-            squared_dev, sphere_to_link, num_segments=n_links
-        )
-        link_var = link_var_sum / (link_counts + 1e-8)
-
-        link_uniform = link_var / (link_mean**2 + 1e-8)
-
-        valid_links = link_counts > 1
-        uniform_loss = jnp.sum(jnp.where(valid_links, link_uniform, 0.0))
-        n_valid_links = jnp.sum(valid_links)
-        total_loss = total_loss + params.lambda_uniform * uniform_loss / (
-            n_valid_links + 1e-8
+        # Create padded sphere vars tuple (use SphereVar(0) as padding placeholder)
+        link_sphere_vars = tuple(
+            SphereVar(sphere_start + i) if i < n_link_spheres else SphereVar(0)
+            for i in range(max_spheres_per_link)
         )
 
-    # 5. Self-collision loss between non-contiguous links
-    world_diff = world_centers_current[:, None, :] - world_centers_current[None, :, :]
-    world_dists = jnp.sqrt(jnp.sum(world_diff**2, axis=-1) + 1e-8)
-    sum_radii_mat = radii[:, None] + radii[None, :]
-    signed_dist = world_dists - sum_radii_mat
-    overlap = jnp.maximum(0.0, -signed_dist) ** 2
+        # Create masks
+        sphere_mask = jnp.arange(max_spheres_per_link) < n_link_spheres
+        point_mask = jnp.arange(max_points_per_link) < n_link_points
 
-    triu_mask = jnp.triu(jnp.ones((n_spheres, n_spheres)), k=1)
-    collision_mask = collision_pair_mask * triu_mask
-
-    n_collision_pairs = jnp.sum(collision_mask)
-    self_collision_loss = jnp.sum(collision_mask * overlap) / (n_collision_pairs + 1e-8)
-    total_loss = total_loss + params.lambda_self_collision * self_collision_loss
-
-    # 6. Center regularization
-    center_drift = jnp.sum((centers - initial_centers) ** 2, axis=-1)
-    center_reg = jnp.mean(center_drift) / (scale**2 + 1e-8)
-    radii_drift = (radii - initial_radii) ** 2
-    radii_reg = jnp.mean(radii_drift) / (scale**2 + 1e-8)
-    total_loss = total_loss + params.lambda_center_reg * (center_reg + radii_reg)
-
-    # 7. Similarity loss (position correspondence between matched spheres)
-    n_sim_pairs = similarity_pairs.shape[0]
-    if n_sim_pairs > 0:
-        idx_a = similarity_pairs[:, 0]
-        idx_b = similarity_pairs[:, 1]
-        local_centers_a = centers[idx_a]
-        local_centers_b = centers[idx_b]
-
-        pair_dists_sq = jnp.sum((local_centers_a - local_centers_b) ** 2, axis=-1) / (
-            scale**2 + 1e-8
+        costs.append(
+            _under_approx_cost(
+                link_sphere_vars,
+                padded_points,
+                sphere_mask,
+                point_mask,
+                params.lambda_under,
+            )
         )
-        similarity_loss = jnp.mean(pair_dists_sq)
-        total_loss = total_loss + params.lambda_similarity * similarity_loss
 
-    return total_loss
+    # Over-approximation costs: penalize large sphere volumes
+    costs.append(
+        _over_approx_cost(
+            sphere_vars,
+            data.scale,
+            params.lambda_over,
+        )
+    )
+
+    # Center regularization: penalize deviation from initial positions
+    costs.append(
+        _center_reg_cost(
+            sphere_vars,
+            data.spheres.center,
+            data.scale,
+            params.lambda_center_reg,
+        )
+    )
+
+    # Radius regularization: penalize deviation from initial radii
+    costs.append(
+        _radius_reg_cost(
+            sphere_vars,
+            data.spheres.radius,
+            data.scale,
+            params.lambda_radius_reg,
+        )
+    )
+
+    # Self-collision costs: one per collision pair
+    # Note: The lambda_self_collision > 0 check is done before calling this function
+    # (in refine_robot_spheres) to avoid JIT tracing issues with the conditional
+    for i, j in collision_pairs:
+        costs.append(
+            _self_collision_cost(
+                SphereVar(i),
+                SphereVar(j),
+                data.sphere_transforms[i],
+                data.sphere_transforms[j],
+                params.lambda_self_collision,
+            )
+        )
+
+    return costs
 
 
 # =============================================================================
-# Optimization loop (internal, JIT-compiled)
+# Optimization loop
 # =============================================================================
 
 
 @jdc.jit
 def _run_robot_optimization(
     data: _FlattenedSphereData,
-    ctx: RobotRefineContext,
-    lr: float,
+    params: RefineParams,
     n_iters: jdc.Static[int],
     tol: float,
+    collision_pairs: jdc.Static[tuple[tuple[int, int], ...]],
 ) -> tuple[Sphere, jnp.ndarray, jnp.ndarray, jnp.ndarray]:
-    """Run the full optimization loop (JIT-compiled with early stopping).
+    """Run the full optimization loop using jaxls nonlinear least squares.
 
     Args:
         data: Flattened sphere/point data with initial spheres
-        ctx: Robot refinement context with collision masks and params
-        lr: Learning rate for Adam optimizer
+        params: Refinement parameters
         n_iters: Maximum number of optimization iterations
         tol: Relative convergence tolerance for early stopping
+        collision_pairs: Static tuple of (sphere_idx_i, sphere_idx_j) pairs
 
     Returns:
         Tuple of (final_spheres, init_loss, final_loss, n_steps)
     """
-    spheres = data.spheres
-    optimizer = optax.chain(optax.clip_by_global_norm(1.0), optax.adam(lr))
-    opt_state = optimizer.init(spheres)  # type: ignore[arg-type]
+    n_spheres = data.n_spheres
 
-    init_loss = _compute_robot_loss(spheres, data, ctx)
+    # Create sphere variables
+    sphere_vars = SphereVar(jnp.arange(n_spheres))
 
-    def body_fn(state):
-        """Single optimization step."""
-        spheres, opt_state, prev_loss, curr_loss, i = state
+    # Build costs
+    costs = _build_jaxls_costs(data, params, list(collision_pairs))
 
-        def loss_fn(s: Sphere) -> jnp.ndarray:
-            return _compute_robot_loss(s, data, ctx)
+    if not costs:
+        # No costs to optimize, return initial spheres
+        return data.spheres, jnp.array(0.0), jnp.array(0.0), jnp.array(0)
 
-        _, grads = jax.value_and_grad(loss_fn)(spheres)
-        updates, new_opt_state = optimizer.update(grads, opt_state, spheres)  # type: ignore[arg-type]
-        new_spheres: Sphere = optax.apply_updates(spheres, updates)  # type: ignore[assignment]
-
-        # Clamp radii to minimum
-        new_spheres = jdc.replace(
-            new_spheres, radius=jnp.maximum(new_spheres.radius, ctx.params.min_radius)
-        )
-
-        new_loss = loss_fn(new_spheres)
-
-        return (new_spheres, new_opt_state, curr_loss, new_loss, i + 1)
-
-    def cond_fn(state):
-        """Continue while not converged and under max iterations."""
-        spheres, opt_state, prev_loss, curr_loss, i = state
-        rel_change = jnp.abs(prev_loss - curr_loss) / (jnp.abs(prev_loss) + 1e-8)
-        not_converged = jnp.logical_or(jnp.isinf(prev_loss), rel_change > tol)
-        not_max_iters = i < n_iters
-        return jnp.logical_and(not_converged, not_max_iters)
-
-    init_state = (spheres, opt_state, jnp.inf, init_loss, jnp.array(0))
-    final_spheres, _, _, final_loss, n_steps = lax.while_loop(
-        cond_fn, body_fn, init_state
+    # Create initial values
+    initial_vals = jaxls.VarValues.make(
+        [
+            sphere_vars[i].with_value(
+                Sphere(
+                    center=data.spheres.center[i],
+                    radius=data.spheres.radius[i],
+                )
+            )
+            for i in range(n_spheres)
+        ]
     )
 
-    return final_spheres, init_loss, final_loss, n_steps  # type: ignore[return-value]
+    # Build and solve the problem
+    problem = jaxls.LeastSquaresProblem(costs=costs, variables=[sphere_vars])
+    analyzed = problem.analyze()
+
+    # Compute initial cost
+    init_residual = analyzed.compute_residual_vector(initial_vals)
+    init_loss = jnp.sum(init_residual**2)
+
+    # Solve
+    solution, summary = analyzed.solve(
+        initial_vals=initial_vals,
+        termination=jaxls.TerminationConfig(
+            max_iterations=n_iters,
+            cost_tolerance=tol,
+        ),
+        trust_region=jaxls.TrustRegionConfig(),
+        verbose=False,
+        return_summary=True,
+    )
+
+    # Extract optimized spheres
+    centers_list = []
+    radii_list = []
+    for i in range(n_spheres):
+        sphere = solution[SphereVar(i)]
+        centers_list.append(sphere.center)
+        radii_list.append(sphere.radius)
+
+    final_centers = jnp.stack(centers_list)
+    final_radii = jnp.stack(radii_list)
+
+    # Clamp radii to minimum
+    final_radii = jnp.maximum(final_radii, params.min_radius)
+
+    final_spheres = Sphere(center=final_centers, radius=final_radii)
+
+    # Compute final cost
+    final_vals = jaxls.VarValues.make(
+        [
+            sphere_vars[i].with_value(
+                Sphere(center=final_centers[i], radius=final_radii[i])
+            )
+            for i in range(n_spheres)
+        ]
+    )
+    final_residual = analyzed.compute_residual_vector(final_vals)
+    final_loss = jnp.sum(final_residual**2)
+
+    return final_spheres, init_loss, final_loss, summary.iterations
 
 
 # =============================================================================
@@ -634,11 +664,16 @@ def refine_robot_spheres(
     joint_limits: tuple[np.ndarray, np.ndarray],
     compute_transforms: Callable[[np.ndarray], np.ndarray],
     non_contiguous_pairs: list[tuple[str, str]],
-    similarity_result: SimilarityResult | None,
     refine_params: RefineParams | None = None,
+    joint_cfg: np.ndarray | None = None,
+    excluded_pairs: set[tuple[str, str]] | None = None,
 ) -> dict[str, list[Sphere]]:
     """
     Refine sphere parameters for all robot links jointly.
+
+    Uses under-approximation (spheres must cover mesh surface),
+    over-approximation (minimize sphere volumes), and self-collision
+    (penalize overlap between non-adjacent links) costs.
 
     This is the internal entry point called by Robot.refine().
 
@@ -649,15 +684,15 @@ def refine_robot_spheres(
         joint_limits: Tuple of (lower_limits, upper_limits) arrays.
         compute_transforms: Function that takes joint_cfg and returns (N, 7) transforms.
         non_contiguous_pairs: List of (link_a, link_b) pairs that are not adjacent.
-        similarity_result: Result from detect_similar_links() for similarity regularization.
         refine_params: Refinement parameters. If None, uses defaults.
+        joint_cfg: Joint configuration for FK computation. If None, uses middle of
+            joint limits.
+        excluded_pairs: Link pairs to skip for collision checking (user-disabled).
 
     Returns:
         Dict mapping link names to refined lists of Sphere objects
     """
-    # Apply defaults
     p = refine_params or RefineParams()
-    joint_cfg = None  # Use middle of limits by default
 
     # Get link names with spheres
     link_names = [name for name in all_link_names if link_spheres.get(name)]
@@ -666,7 +701,7 @@ def refine_robot_spheres(
 
     link_name_to_idx = {name: idx for idx, name in enumerate(all_link_names)}
 
-    # Compute FK
+    # Compute FK at specified config or middle of joint limits
     if joint_cfg is None:
         lower, upper = joint_limits
         joint_cfg = (lower + upper) / 2
@@ -681,97 +716,39 @@ def refine_robot_spheres(
         else:
             link_points[link_name] = np.zeros((0, 3))
 
-    # Build flattened data
-    flat_data, all_centers = _build_flattened_sphere_data(
+    # Build flattened data (with transforms)
+    flat_data = _build_flattened_sphere_data(
         link_spheres, link_points, link_names, Ts, link_name_to_idx
     )
 
     if flat_data is None:
         return link_spheres
 
-    assert all_centers is not None  # guaranteed by above check
-
-    # Build collision pair mask
-    logger.info("Computing mesh distances for link pairs...")
-    link_name_to_internal = {name: i for i, name in enumerate(link_names)}
-    pairs_with_spheres = []
-    for link_a, link_b in non_contiguous_pairs:
-        if link_a not in link_name_to_internal or link_b not in link_name_to_internal:
-            continue
-        range_a = flat_data.link_sphere_ranges[link_name_to_internal[link_a]]
-        range_b = flat_data.link_sphere_ranges[link_name_to_internal[link_b]]
-        if range_a[0] < range_a[1] and range_b[0] < range_b[1]:
-            pairs_with_spheres.append((link_a, link_b))
-
-    mesh_distances = compute_mesh_distances_batch(
-        link_meshes,
-        pairs_with_spheres,
-        all_link_names,
-        joint_limits,
-        compute_transforms,
-        n_samples=1000,
-        bbox_skip_threshold=0.1,
-        joint_cfg=joint_cfg,
-    )
-
-    collision_pair_mask, valid_pairs, skipped_pairs = _build_collision_pair_mask(
-        flat_data.n_spheres,
-        list(flat_data.link_names),
-        list(flat_data.link_sphere_ranges),
-        non_contiguous_pairs,
-        mesh_distances,
-        p.mesh_collision_tolerance,
-    )
-
-    if skipped_pairs:
-        logger.debug(
-            f"Skipping {len(skipped_pairs)} link pairs with inherent mesh proximity"
-        )
-    logger.info(f"Checking self-collision for {len(valid_pairs)} link pairs")
-
-    # Build similarity pairs (using all_centers returned separately)
-    similarity_pairs_array, similarity_pairs_list = _build_similarity_pairs(
-        similarity_result,
-        list(flat_data.link_names),
-        list(flat_data.link_sphere_ranges),
-        all_centers,
-        p.lambda_similarity,
-    )
-
-    if similarity_pairs_list:
-        logger.info(
-            f"Similarity regularization: {len(similarity_pairs_list)} matched sphere pairs"
+    # Build collision pairs only if self-collision is enabled
+    # This check must be done here (not in JIT) to avoid tracing issues
+    collision_pairs: list[tuple[int, int]] = []
+    if p.lambda_self_collision > 0:
+        # Build collision pairs
+        collision_pairs, valid_link_pairs = _build_collision_pairs(
+            list(flat_data.link_names),
+            list(flat_data.link_sphere_ranges),
+            non_contiguous_pairs,
+            excluded_pairs,
         )
 
-    # Log initial self-collision distance (excludes adjacent links and inherently close meshes)
-    initial_min_dist = compute_min_self_collision_distance(
-        link_spheres,
-        all_link_names,
-        joint_limits,
-        compute_transforms,
-        non_contiguous_pairs,
-        valid_pairs=valid_pairs,
-        joint_cfg=joint_cfg,
-    )
-    if initial_min_dist < 0:
-        logger.info(f"Self-collision: {-initial_min_dist:.4f} penetration (initial)")
-    else:
-        logger.info(f"Self-collision: {initial_min_dist:.4f} clearance (initial)")
-
-    # Create refinement context
-    ctx = RobotRefineContext(
-        collision_pair_mask=collision_pair_mask,
-        similarity_pairs=similarity_pairs_array,
-        params=p,
-    )
+        if collision_pairs:
+            logger.info(
+                f"Self-collision: checking {len(collision_pairs)} sphere pairs "
+                f"across {len(valid_link_pairs)} link pairs"
+            )
 
     # Run optimization
     final_spheres, init_loss, final_loss, n_steps = _run_robot_optimization(
         flat_data,
-        ctx,
-        p.lr,
+        p,
         p.n_iters,
         p.tol,
+        tuple(collision_pairs),
     )
 
     logger.info(
@@ -790,20 +767,5 @@ def refine_robot_spheres(
         list(flat_data.link_sphere_ranges),
         link_spheres,
     )
-
-    # Log final self-collision distance
-    final_min_dist = compute_min_self_collision_distance(
-        refined_link_spheres,
-        all_link_names,
-        joint_limits,
-        compute_transforms,
-        non_contiguous_pairs,
-        valid_pairs=valid_pairs,
-        joint_cfg=joint_cfg,
-    )
-    if final_min_dist < 0:
-        logger.info(f"Self-collision: {-final_min_dist:.4f} penetration (final)")
-    else:
-        logger.info(f"Self-collision: {final_min_dist:.4f} clearance (final)")
 
     return refined_link_spheres

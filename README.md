@@ -6,7 +6,7 @@ Given a 3D mesh or a robot URDF, create a "ballpark" estimate of its spherical c
 
 Features include:
 - Fast mesh-to-sphere decomposition via recursive PCA-based splitting.
-- Sphere set optimization with volume/surface/overlap losses, and more.
+- Sphere set optimization with volume-based losses, and more.
 - Different presets for conservative, balanced, or surface-fitting sphere sets.
 
 For robot URDFs, we also include:
