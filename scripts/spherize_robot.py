@@ -51,14 +51,19 @@ def main(
     result = robot.spherize(target_spheres=target_spheres)
 
     # Optionally refine spheres
-    if refine:
-        logger.info("Refining spheres...")
-        result = robot.refine(result)
+    # if refine:
+    #     logger.info("Refining spheres...")
+    #     result = robot.refine(result)
+
+    result = robot.refine_ellipsoids(result)
 
     # Export to JSON
     result.save_json(output_path)
+    # logger.info(
+    #     f"Exported spheres to {output_path} (total spheres={result.num_spheres})"
+    # )
     logger.info(
-        f"Exported spheres to {output_path} (total spheres={result.num_spheres})"
+        f"Exported ellipsoids to {output_path} (total ellipsoids={result.num_ellipsoids})"
     )
 
 

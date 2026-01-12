@@ -26,7 +26,9 @@ from viser.extras import ViserUrdf
 from ballpark import (
     Robot,
     RobotSpheresResult,
+    RobotEllipsoidsResult,
     Sphere,
+    Ellipsoid,
     SPHERE_COLORS,
     BallparkConfig,
     SpherizeParams,
@@ -60,13 +62,19 @@ def main(
 
     gui = _SpheresGui(server, robot)
     sphere_visuals = _SphereVisuals(server, robot.links)
+    ellipsoid_visuals = _EllipsoidVisuals(server, robot.links)
 
     # Current sphere result (updated when settings change)
     result: RobotSpheresResult | None = None
+    ellipsoid_result: RobotEllipsoidsResult | None = None
     target_spheres: int = 0
 
     def on_export() -> None:
-        if result:
+        if gui.use_ellipsoids and ellipsoid_result:
+            path = Path(gui.export_filename)
+            ellipsoid_result.save_json(path)
+            print(f"Exported {ellipsoid_result.num_ellipsoids} ellipsoids to {path}")
+        elif result:
             path = Path(gui.export_filename)
             result.save_json(path)
             print(f"Exported {result.num_spheres} spheres to {path}")
@@ -115,34 +123,64 @@ def main(
             config = gui.get_config()
             if gui.refine_enabled and result.num_spheres > 0:
                 t0 = time.perf_counter()
-                refined = robot.refine(
-                    result,
-                    config=config,
-                    joint_cfg=gui.joint_config,
-                    excluded_pairs=gui.excluded_collision_pairs,
-                )
-                elapsed = (time.perf_counter() - t0) * 1000
-                print(f"Refined spheres in {elapsed:.1f}ms")
-                sphere_visuals.update(refined, gui.opacity, gui.show_spheres)
+                if gui.use_ellipsoids:
+                    # Refine to ellipsoids
+                    ellipsoid_result = robot.refine_ellipsoids(
+                        result,
+                        config=config,
+                        joint_cfg=gui.joint_config,
+                        excluded_pairs=gui.excluded_collision_pairs,
+                    )
+                    elapsed = (time.perf_counter() - t0) * 1000
+                    print(
+                        f"Refined to {ellipsoid_result.num_ellipsoids} ellipsoids in {elapsed:.1f}ms"
+                    )
+                    sphere_visuals.update(None, gui.opacity, False)  # Hide spheres
+                    ellipsoid_visuals.update(
+                        ellipsoid_result, gui.opacity, gui.show_spheres
+                    )
+                else:
+                    # Refine spheres
+                    refined = robot.refine(
+                        result,
+                        config=config,
+                        joint_cfg=gui.joint_config,
+                        excluded_pairs=gui.excluded_collision_pairs,
+                    )
+                    elapsed = (time.perf_counter() - t0) * 1000
+                    print(f"Refined spheres in {elapsed:.1f}ms")
+                    ellipsoid_visuals.update(
+                        None, gui.opacity, False
+                    )  # Hide ellipsoids
+                    sphere_visuals.update(refined, gui.opacity, gui.show_spheres)
+                    ellipsoid_result = None
             else:
+                ellipsoid_visuals.update(None, gui.opacity, False)
                 sphere_visuals.update(result, gui.opacity, gui.show_spheres)
+                ellipsoid_result = None
 
             gui.mark_refine_updated()
             gui.mark_visuals_updated()
 
         # Update sphere visuals if only appearance changed (opacity, visibility)
         if gui.needs_visual_update and result:
-            sphere_visuals.update(result, gui.opacity, gui.show_spheres)
+            if gui.use_ellipsoids and ellipsoid_result:
+                ellipsoid_visuals.update(
+                    ellipsoid_result, gui.opacity, gui.show_spheres
+                )
+            else:
+                sphere_visuals.update(result, gui.opacity, gui.show_spheres)
             gui.mark_visuals_updated()
 
         # Update robot pose from joint sliders
         cfg = gui.joint_config
         urdf_vis.update_cfg(cfg)
 
-        # Transform spheres to match current link poses
+        # Transform primitives to match current link poses
         if gui.show_spheres:
             Ts = robot.compute_transforms(cfg)
             sphere_visuals.update_transforms(Ts)
+            ellipsoid_visuals.update_transforms(Ts)
 
         time.sleep(0.05)
 
@@ -167,6 +205,7 @@ class _SpheresGui:
         self._last_show: bool = True
         self._last_opacity: float = 0.9
         self._last_refine: bool = False
+        self._last_use_ellipsoids: bool = False
         self._last_preset: str = "Balanced"
         self._last_params: dict[str, float] = {}
         self._last_joint_config: np.ndarray | None = None  # Track joint config changes
@@ -201,6 +240,9 @@ class _SpheresGui:
                 )
                 self._refine = server.gui.add_checkbox(
                     "Refine (optimize)", initial_value=False
+                )
+                self._use_ellipsoids = server.gui.add_checkbox(
+                    "Use Ellipsoids", initial_value=False
                 )
 
             # Config folder - preset and parameters
@@ -342,6 +384,11 @@ class _SpheresGui:
         if self._refine.value != self._last_refine:
             self._last_refine = self._refine.value
             self._needs_refine_update = True  # NOT _needs_spherize
+
+        # Ellipsoid checkbox change - affects refine
+        if self._use_ellipsoids.value != self._last_use_ellipsoids:
+            self._last_use_ellipsoids = self._use_ellipsoids.value
+            self._needs_refine_update = True
 
         # Visibility/opacity change
         if (
@@ -624,6 +671,10 @@ class _SpheresGui:
         return self._refine.value
 
     @property
+    def use_ellipsoids(self) -> bool:
+        return self._use_ellipsoids.value
+
+    @property
     def joint_config(self) -> np.ndarray:
         return np.array([s.value for s in self._joint_sliders])
 
@@ -651,7 +702,7 @@ class _SphereVisuals:
 
     def update(
         self,
-        result: RobotSpheresResult,
+        result: RobotSpheresResult | None,
         opacity: float,
         visible: bool,
     ) -> None:
@@ -663,6 +714,11 @@ class _SphereVisuals:
             f.remove()
         self._handles.clear()
         self._frames.clear()
+
+        if result is None:
+            self._link_spheres = {}
+            return
+
         self._link_spheres = result.link_spheres
 
         if not visible:
@@ -706,6 +762,101 @@ class _SphereVisuals:
 
             for sphere_idx in range(len(spheres)):
                 key = f"{link_name}_{sphere_idx}"
+                if key in self._frames:
+                    self._frames[key].wxyz = wxyz
+                    self._frames[key].position = pos
+
+
+class _EllipsoidVisuals:
+    """Manages ellipsoid visualization in viser.
+
+    Ellipsoids are visualized as scaled icospheres (stretched along semi-axes).
+    """
+
+    def __init__(self, server: viser.ViserServer, link_names: list[str]):
+        self._server = server
+        self._link_names = link_names
+        self._frames: dict[str, viser.FrameHandle] = {}
+        self._handles: dict[str, viser.MeshHandle] = {}
+        self._link_ellipsoids: dict[str, list[Ellipsoid]] = {}
+
+    def update(
+        self,
+        result: RobotEllipsoidsResult | None,
+        opacity: float,
+        visible: bool,
+    ) -> None:
+        """Rebuild ellipsoid visuals from result."""
+        import trimesh
+
+        # Clear existing
+        for h in self._handles.values():
+            h.remove()
+        for f in self._frames.values():
+            f.remove()
+        self._handles.clear()
+        self._frames.clear()
+
+        if result is None:
+            self._link_ellipsoids = {}
+            return
+
+        self._link_ellipsoids = result.link_ellipsoids
+
+        if not visible:
+            return
+
+        for link_idx, link_name in enumerate(self._link_names):
+            ellipsoids = self._link_ellipsoids.get(link_name, [])
+            if not ellipsoids:
+                continue
+
+            color = SPHERE_COLORS[link_idx % len(SPHERE_COLORS)]
+            rgb = (color[0] / 255.0, color[1] / 255.0, color[2] / 255.0)
+
+            for ell_idx, ell in enumerate(ellipsoids):
+                key = f"{link_name}_{ell_idx}"
+                frame = self._server.scene.add_frame(
+                    f"/ellipsoid_frames/{key}",
+                    wxyz=(1, 0, 0, 0),
+                    position=(0, 0, 0),
+                    show_axes=False,
+                )
+                self._frames[key] = frame
+
+                # Create ellipsoid mesh by scaling a unit sphere
+                sphere_mesh = trimesh.creation.icosphere(radius=1.0, subdivisions=2)
+                semi_axes = ell.semi_axes
+                sphere_mesh.vertices = sphere_mesh.vertices * np.array(
+                    [
+                        float(semi_axes[0]),
+                        float(semi_axes[1]),
+                        float(semi_axes[2]),
+                    ]
+                )
+
+                center = ell.center
+                self._handles[key] = self._server.scene.add_mesh_simple(
+                    f"/ellipsoid_frames/{key}/ellipsoid",
+                    vertices=sphere_mesh.vertices.astype(np.float32),
+                    faces=sphere_mesh.faces.astype(np.uint32),
+                    position=(float(center[0]), float(center[1]), float(center[2])),
+                    color=rgb,
+                    opacity=opacity,
+                )
+
+    def update_transforms(self, Ts_link_world: np.ndarray) -> None:
+        """Update ellipsoid positions from link transforms."""
+        for link_idx, link_name in enumerate(self._link_names):
+            ellipsoids = self._link_ellipsoids.get(link_name, [])
+            if not ellipsoids:
+                continue
+
+            T = Ts_link_world[link_idx]
+            wxyz, pos = T[:4], T[4:]
+
+            for ell_idx in range(len(ellipsoids)):
+                key = f"{link_name}_{ell_idx}"
                 if key in self._frames:
                     self._frames[key].wxyz = wxyz
                     self._frames[key].position = pos

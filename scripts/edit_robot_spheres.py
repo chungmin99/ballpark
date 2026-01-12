@@ -67,6 +67,15 @@ class SphereDataStore:
         self.data[link]["radii"][idx] = new_radius
         self.dirty = True
 
+    def delete_sphere(self, link: str, idx: int) -> None:
+        """Delete a sphere from the data."""
+        del self.data[link]["centers"][idx]
+        del self.data[link]["radii"][idx]
+        # Remove link entry if no spheres remain
+        if len(self.data[link]["radii"]) == 0:
+            del self.data[link]
+        self.dirty = True
+
     def save(self) -> None:
         """Write current data back to JSON file."""
         with open(self.path, "w") as f:
@@ -100,6 +109,7 @@ class _EditorGui:
         # Callbacks
         self._on_save: Callable[[], None] | None = None
         self._on_deselect: Callable[[], None] | None = None
+        self._on_delete: Callable[[], None] | None = None
         self._on_radius_change: Callable[[float], None] | None = None
 
         # Selection info folder (created dynamically)
@@ -159,6 +169,9 @@ class _EditorGui:
     def set_on_deselect(self, callback: Callable[[], None]) -> None:
         self._on_deselect = callback
 
+    def set_on_delete(self, callback: Callable[[], None]) -> None:
+        self._on_delete = callback
+
     def set_on_radius_change(self, callback: Callable[[float], None]) -> None:
         self._on_radius_change = callback
 
@@ -190,6 +203,13 @@ class _EditorGui:
             def _(_) -> None:
                 if self._on_radius_change and self._radius_slider is not None:
                     self._on_radius_change(float(self._radius_slider.value))
+
+            delete_button = self._server.gui.add_button("Delete", color="red")
+
+            @delete_button.on_click
+            def _(_) -> None:
+                if self._on_delete:
+                    self._on_delete()
 
     def hide_selection_info(self) -> None:
         """Hide the selected sphere info folder."""
@@ -625,8 +645,21 @@ def main(
             sphere_visuals.update_selected_radius(new_radius)
             gui.update_status()
 
+    def on_delete() -> None:
+        if sphere_visuals._selected_key is not None:
+            parts = sphere_visuals._selected_key.rsplit("_", 1)
+            link_name, idx = parts[0], int(parts[1])
+            # Deselect first, then delete
+            sphere_visuals.deselect()
+            gui.hide_selection_info()
+            data_store.delete_sphere(link_name, idx)
+            # Rebuild visuals to reflect deletion
+            sphere_visuals.rebuild(gui.opacity, gui.show_spheres)
+            gui.update_status()
+
     gui.set_on_save(on_save)
     gui.set_on_deselect(on_deselect)
+    gui.set_on_delete(on_delete)
     gui.set_on_radius_change(on_radius_change)
     sphere_visuals.set_on_select(on_select)
     sphere_visuals.set_on_position_change(on_position_change)
