@@ -62,7 +62,9 @@ def main(
 
     # Export to JSON
     result.save_json(output_path)
-    logger.info(f"Exported {geom_type}s to {output_path} (total {geom_type}={result})")
+    logger.info(
+        f"Exported {geom_type}s to {output_path} (total {geom_type}={result.n_primitives})"
+    )
 
 
 if __name__ == "__main__":

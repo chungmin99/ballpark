@@ -31,6 +31,11 @@ class RobotSpheresResult:
         """Total number of spheres across all links."""
         return sum(len(spheres) for spheres in self.link_spheres.values())
 
+    @property
+    def n_primitives(self) -> int:
+        """Total number of primitives (spheres)."""
+        return self.num_spheres
+
     def save_json(self, path: Path) -> None:
         """Save spheres to JSON file."""
         import json
@@ -56,6 +61,11 @@ class RobotEllipsoidsResult:
     def num_ellipsoids(self) -> int:
         """Total number of ellipsoids across all links."""
         return sum(len(ellipsoids) for ellipsoids in self.link_ellipsoids.values())
+
+    @property
+    def n_primitives(self) -> int:
+        """Total number of primitives (ellipsoids)."""
+        return self.num_ellipsoids
 
     def save_json(self, path: Path) -> None:
         """Save ellipsoids to JSON file."""
