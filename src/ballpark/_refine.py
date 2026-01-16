@@ -286,8 +286,11 @@ def _under_approx_cost(
     min_signed_dist = jnp.min(signed_dists, axis=1)  # (P,)
 
     # Compute residuals, zeroing out invalid points
+    # Normalize by sqrt(n_valid_points) to make loss invariant to point count
     residuals = jnp.sqrt(lambda_under) * jnp.maximum(0.0, min_signed_dist)
-    return jnp.where(point_mask, residuals, 0.0)
+    n_valid = jnp.sum(point_mask)
+    normalized_residuals = residuals / jnp.sqrt(n_valid + 1e-8)
+    return jnp.where(point_mask, normalized_residuals, 0.0)
 
 
 @jaxls.Cost.factory
@@ -301,7 +304,7 @@ def _over_approx_cost(
     sphere = vals[sphere_var]
     radius = jnp.maximum(sphere.radius, 1e-4)
     # Residual proportional to radius^1.5 (volume^0.5)
-    return jnp.sqrt(lambda_over) * (radius / scale) ** 1.5
+    return jnp.sqrt(lambda_over) * (radius) ** 1.5
 
 
 @jaxls.Cost.factory
@@ -325,7 +328,7 @@ def _center_reg_cost(
         Residual vector of shape (3,), one per coordinate
     """
     sphere = vals[sphere_var]
-    return jnp.sqrt(lambda_center_reg) * (sphere.center - init_center) / scale
+    return jnp.sqrt(lambda_center_reg) * (sphere.center - init_center)
 
 
 @jaxls.Cost.factory
@@ -349,7 +352,7 @@ def _radius_reg_cost(
         Scalar residual
     """
     sphere = vals[sphere_var]
-    return jnp.sqrt(lambda_radius_reg) * (sphere.radius - init_radius) / scale
+    return jnp.sqrt(lambda_radius_reg) * (sphere.radius - init_radius)
 
 
 @jaxls.Cost.factory
@@ -991,9 +994,12 @@ def _ellipsoid_under_approx_cost(
 
     # residuals: lambda * max(0, dist)
     # We use point_mask at the very end to zero out invalid points
+    # Normalize by sqrt(n_valid_points) to make loss invariant to point count
     raw_residuals = jnp.sqrt(lambda_under) * jnp.maximum(0.0, min_signed_dist)
+    n_valid = jnp.sum(point_mask)
+    normalized_residuals = raw_residuals / jnp.sqrt(n_valid + 1e-8)
 
-    return jnp.where(point_mask, raw_residuals, 0.0)
+    return jnp.where(point_mask, normalized_residuals, 0.0)
 
 
 @jaxls.Cost.factory
@@ -1012,9 +1018,9 @@ def _ellipsoid_over_approx_cost(
     ell = vals[ellipsoid_var]
     semi_axes = jnp.maximum(ell.semi_axes, 1e-4)
     # Per-axis penalty: each axis contributes independently to the loss
-    # The /3 normalizes so that for a=b=c=r, total loss matches sphere
+    # Normalize by 3 so total gradient matches sphere (which has 1 residual)
     per_axis = (semi_axes / scale) ** 1.5
-    return jnp.sqrt(lambda_over / 3) * per_axis
+    return jnp.sqrt(lambda_over / 3.0) * per_axis
 
 
 @jaxls.Cost.factory
@@ -1022,12 +1028,10 @@ def _ellipsoid_center_reg_cost(
     vals: jaxls.VarValues,
     ellipsoid_var: EllipsoidVar,
     init_center: jax.Array,
-    scale: float,
     lambda_center_reg: float,
 ) -> jax.Array:
-    """Center regularization: penalize deviation from initial center position."""
     ell = vals[ellipsoid_var]
-    return jnp.sqrt(lambda_center_reg) * (ell.center - init_center) / scale
+    return jnp.sqrt(lambda_center_reg) * (ell.center - init_center)
 
 
 @jaxls.Cost.factory
@@ -1035,18 +1039,10 @@ def _ellipsoid_semi_axes_reg_cost(
     vals: jaxls.VarValues,
     ellipsoid_var: EllipsoidVar,
     init_semi_axes: jax.Array,
-    scale: float,
     lambda_radius_reg: float,
 ) -> jax.Array:
-    """Semi-axes regularization: penalize change in mean radius only.
-
-    Unlike per-axis regularization, this allows shape changes (squishing)
-    while still penalizing overall size drift.
-    """
     ell = vals[ellipsoid_var]
-    mean_init = jnp.mean(init_semi_axes)
-    mean_curr = jnp.mean(ell.semi_axes)
-    return jnp.sqrt(lambda_radius_reg) * (mean_curr - mean_init) / scale
+    return jnp.sqrt(lambda_radius_reg) * (ell.semi_axes - init_semi_axes)
 
 
 @jaxls.Cost.factory
@@ -1101,7 +1097,6 @@ def _ellipsoid_self_collision_cost(
     direction = center_to_center / (dist_centers + 1e-8)
 
     # For axis-aligned ellipsoids, use direction directly
-    # (In Phase 2 with rotated ellipsoids, we'd transform to local frame)
     r_i_eff = ellipsoid_effective_radius(semi_axes_i, direction)
     r_j_eff = ellipsoid_effective_radius(semi_axes_j, -direction)
 
@@ -1185,7 +1180,6 @@ def _build_ellipsoid_jaxls_costs(
                 _ellipsoid_center_reg_cost(
                     ell_var,
                     init_center,
-                    data.scale,
                     params.lambda_center_reg,
                 )
             )
@@ -1196,7 +1190,6 @@ def _build_ellipsoid_jaxls_costs(
                 _ellipsoid_semi_axes_reg_cost(
                     ell_var,
                     init_semi_axes,
-                    data.scale,
                     params.lambda_radius_reg,
                 )
             )
