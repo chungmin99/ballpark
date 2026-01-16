@@ -10,7 +10,6 @@ from ._robot import RobotEllipsoidsResult as RobotEllipsoidsResult
 from ._spherize import Sphere as Sphere
 from ._spherize import spherize as spherize
 from ._primitives import Ellipsoid as Ellipsoid
-from ._primitives import RotatedEllipsoid as RotatedEllipsoid
 from ._primitives import ellipsoid_effective_radius as ellipsoid_effective_radius
 from ._primitives import ellipsoid_point_distance as ellipsoid_point_distance
 from ._primitives import ellipsoid_ellipsoid_distance as ellipsoid_ellipsoid_distance

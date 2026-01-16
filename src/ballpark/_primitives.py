@@ -37,48 +37,6 @@ class Ellipsoid:
     semi_axes: jnp.ndarray
 
 
-@jdc.pytree_dataclass
-class RotatedEllipsoid:
-    """Full rotated ellipsoid with SE(3) pose.
-
-    The ellipsoid is axis-aligned in its local frame, with orientation
-    defined by the pose's rotation. Semi-axes define half-lengths along
-    the local x, y, z axes.
-    """
-
-    pose: jaxlie.SE3
-    semi_axes: jnp.ndarray
-
-    @property
-    def center(self) -> jnp.ndarray:
-        """World-frame center position."""
-        return self.pose.translation()
-
-    @property
-    def rotation(self) -> jaxlie.SO3:
-        """Orientation as SO(3)."""
-        return self.pose.rotation()
-
-    @staticmethod
-    def from_center_and_axes(
-        center: jnp.ndarray,
-        semi_axes: jnp.ndarray,
-        wxyz: jnp.ndarray | None = None,
-    ) -> "RotatedEllipsoid":
-        """Create a RotatedEllipsoid from center, semi-axes, and optional rotation.
-
-        Args:
-            center: Position in world frame (3,).
-            semi_axes: Half-lengths along local axes (3,).
-            wxyz: Quaternion orientation (4,). Default is identity.
-        """
-        if wxyz is None:
-            wxyz = jnp.array([1.0, 0.0, 0.0, 0.0])
-        wxyz_xyz = jnp.concatenate([wxyz, center], axis=-1)
-        pose = jaxlie.SE3(wxyz_xyz)
-        return RotatedEllipsoid(pose=pose, semi_axes=semi_axes)
-
-
 # =============================================================================
 # Utility Functions
 # =============================================================================
