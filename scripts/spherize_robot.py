@@ -18,6 +18,7 @@ def main(
     target_spheres: int = 40,
     output_path: Path = Path("spheres.json"),
     refine: bool = False,
+    use_ellipsoid: bool = False,
 ) -> None:
     """Compute sphere decomposition for a robot URDF.
 
@@ -51,20 +52,17 @@ def main(
     result = robot.spherize(target_spheres=target_spheres)
 
     # Optionally refine spheres
-    # if refine:
-    #     logger.info("Refining spheres...")
-    #     result = robot.refine(result)
-
-    result = robot.refine_ellipsoids(result)
+    geom_type = "ellipse" if use_ellipsoid else "sphere"
+    if refine:
+        logger.info(f"Refining {geom_type}s...")
+        if use_ellipsoid:
+            result = robot.refine_ellipsoids(result)
+        else:
+            result = robot.refine(result)
 
     # Export to JSON
     result.save_json(output_path)
-    # logger.info(
-    #     f"Exported spheres to {output_path} (total spheres={result.num_spheres})"
-    # )
-    logger.info(
-        f"Exported ellipsoids to {output_path} (total ellipsoids={result.num_ellipsoids})"
-    )
+    logger.info(f"Exported {geom_type}s to {output_path} (total {geom_type}={result})")
 
 
 if __name__ == "__main__":
