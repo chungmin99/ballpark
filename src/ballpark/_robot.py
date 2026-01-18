@@ -15,7 +15,8 @@ from loguru import logger
 from ._config import BallparkConfig, SpherePreset, SpherizeParams
 from ._spherize import Sphere, spherize
 from ._similarity import SimilarityResult, detect_similar_links
-from ._refine import refine_robot_spheres
+from ._refine import refine_robot_spheres, refine_robot_ellipsoids
+from ._primitives import Ellipsoid
 from .utils._hash_geometry import get_link_collision_fingerprint
 
 
@@ -30,6 +31,11 @@ class RobotSpheresResult:
         """Total number of spheres across all links."""
         return sum(len(spheres) for spheres in self.link_spheres.values())
 
+    @property
+    def n_primitives(self) -> int:
+        """Total number of primitives (spheres)."""
+        return self.num_spheres
+
     def save_json(self, path: Path) -> None:
         """Save spheres to JSON file."""
         import json
@@ -43,6 +49,56 @@ class RobotSpheresResult:
         }
         with path.open(mode="w") as f:
             json.dump(data, f, indent=2)
+
+
+@dataclass
+class RobotEllipsoidsResult:
+    """Result from robot ellipsoid refinement."""
+
+    link_ellipsoids: dict[str, list[Ellipsoid]]
+
+    @property
+    def num_ellipsoids(self) -> int:
+        """Total number of ellipsoids across all links."""
+        return sum(len(ellipsoids) for ellipsoids in self.link_ellipsoids.values())
+
+    @property
+    def n_primitives(self) -> int:
+        """Total number of primitives (ellipsoids)."""
+        return self.num_ellipsoids
+
+    def save_json(self, path: Path) -> None:
+        """Save ellipsoids to JSON file."""
+        import json
+
+        data = {
+            link_name: {
+                "centers": [e.center.tolist() for e in ellipsoids],
+                "semi_axes": [e.semi_axes.tolist() for e in ellipsoids],
+            }
+            for link_name, ellipsoids in self.link_ellipsoids.items()
+        }
+        with path.open(mode="w") as f:
+            json.dump(data, f, indent=2)
+
+    @staticmethod
+    def load_json(path: Path) -> "RobotEllipsoidsResult":
+        """Load ellipsoids from JSON file."""
+        import json
+        import jax.numpy as jnp
+
+        with path.open(mode="r") as f:
+            data = json.load(f)
+
+        link_ellipsoids = {}
+        for link_name, ellipsoid_data in data.items():
+            centers = ellipsoid_data["centers"]
+            semi_axes = ellipsoid_data["semi_axes"]
+            link_ellipsoids[link_name] = [
+                Ellipsoid(center=jnp.array(c), semi_axes=jnp.array(s))
+                for c, s in zip(centers, semi_axes)
+            ]
+        return RobotEllipsoidsResult(link_ellipsoids=link_ellipsoids)
 
 
 class Robot:
@@ -497,6 +553,47 @@ class Robot:
             excluded_pairs=excluded_pairs,
         )
         return RobotSpheresResult(link_spheres=refined_link_spheres)
+
+    def refine_ellipsoids(
+        self,
+        spheres_result: RobotSpheresResult,
+        config: BallparkConfig | None = None,
+        joint_cfg: np.ndarray | None = None,
+        excluded_pairs: set[tuple[str, str]] | None = None,
+    ) -> RobotEllipsoidsResult:
+        """
+        Refine spheres to ellipsoids using gradient-based optimization.
+
+        Converts initial spheres to axis-aligned ellipsoids and optimizes
+        allowing each primitive to stretch along axes for better geometry fit.
+
+        Uses the effective radius approach for smooth, differentiable collision
+        detection suitable for optimization.
+
+        Args:
+            spheres_result: Result from robot.spherize()
+            config: Configuration for refinement. If None, uses BALANCED preset.
+            joint_cfg: Joint configuration for FK and mesh distances. If None,
+                uses middle of joint limits.
+            excluded_pairs: Link pairs to skip for collision checking.
+
+        Returns:
+            RobotEllipsoidsResult with refined ellipsoids
+        """
+        cfg = config or BallparkConfig.from_preset(SpherePreset.BALANCED)
+
+        refined_link_ellipsoids = refine_robot_ellipsoids(
+            spheres_result.link_spheres,
+            self._link_meshes,
+            self._all_link_names,
+            self.joint_limits,
+            self.compute_transforms,
+            self._non_contiguous_pairs,
+            refine_params=cfg.refine,
+            joint_cfg=joint_cfg,
+            excluded_pairs=excluded_pairs,
+        )
+        return RobotEllipsoidsResult(link_ellipsoids=refined_link_ellipsoids)
 
     def check_self_collision(
         self,

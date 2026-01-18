@@ -89,7 +89,7 @@ class RefineParams:
     lambda_under: float = 1.0
     """Weight for under-approximation loss (points outside spheres)."""
 
-    lambda_over: float = 0.01
+    lambda_over: float = 0.1
     """Weight for over-approximation loss (sphere volume)."""
 
     lambda_overlap: float = 0.1
@@ -105,17 +105,27 @@ class RefineParams:
     """Weight for SQEM loss (signed error with normals)."""
 
     # Robot-level loss weights
-    lambda_self_collision: float = 1.0
+    lambda_self_collision: float = 0.0  # TEMP: disabled to debug NaN
     """Weight for inter-link self-collision penalty."""
 
-    lambda_center_reg: float = 0.1
+    lambda_center_reg: float = 0.01
     """Weight for center drift regularization (penalizes deviation from initial positions)."""
 
-    lambda_radius_reg: float = 0.1
+    lambda_radius_reg: float = 0.01
     """Weight for radius regularization (penalizes deviation from initial radii)."""
 
     lambda_similarity: float = 1.0
     """Weight for similar link correspondence."""
+
+    # Ellipsoid-specific parameters
+    lambda_axis_ratio: float = 0.1
+    """Weight for axis ratio regularization (prevents degenerate ellipsoids)."""
+
+    min_semi_axis: float = 1e-4
+    """Minimum allowed semi-axis length for ellipsoids."""
+
+    max_axis_ratio: float = 5.0
+    """Maximum allowed ratio between largest and smallest semi-axes."""
 
 
 @jdc.pytree_dataclass
